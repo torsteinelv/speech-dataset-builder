@@ -10,12 +10,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- KONFIGURASJON ---
-# Vi henter ikke lenger RSS_URL fast fra .env, men tar det som parameter
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_BASE_FOLDER = "raw/" 
+
+# Hent prosjektmappen fra .env (Default: 002_speech_dataset)
+S3_BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
+S3_TARGET_ROOT = f"{S3_BASE_PATH}/raw/" 
 
 TEMP_DIR = Path("temp_downloads")
 
@@ -32,7 +34,6 @@ def clean_filename(title):
     return cleaned.strip().replace(" ", "_")
 
 def process_single_feed(rss_url):
-    """Laster ned og laster opp episoder fra én RSS-feed"""
     if not S3_BUCKET:
         print("FEIL: Mangler S3_BUCKET i .env")
         return
@@ -66,13 +67,13 @@ def process_single_feed(rss_url):
         if not mp3_url: continue
 
         filename = f"{episode_title}.mp3"
-        s3_key = f"{S3_BASE_FOLDER}{podcast_title}/{filename}"
+        # Struktur: 002_speech_dataset/raw/PodkastNavn/Episode.mp3
+        s3_key = f"{S3_TARGET_ROOT}{podcast_title}/{filename}"
         local_path = TEMP_DIR / filename
 
-        # Sjekk S3
         try:
             s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            # print(f"SKIP (Finnes): {filename}") # Kommenter ut hvis du vil ha mindre spam
+            # print(f"SKIP (Finnes): {filename}") 
             continue
         except:
             pass 
@@ -96,47 +97,24 @@ def process_single_feed(rss_url):
 
 def main():
     parser = argparse.ArgumentParser(description="Last ned podkaster til S3.")
-    
-    # Valg 1: En enkelt URL
     parser.add_argument("--url", type=str, help="URL til én RSS feed")
-    
-    # Valg 2: En fil med mange URLer
-    parser.add_argument("--file", type=str, help="Tekstfil med liste over RSS feeder (én per linje)")
-
+    parser.add_argument("--file", type=str, help="Fil med liste over RSS feeder")
     args = parser.parse_args()
 
-    # Logikk for hva vi skal gjøre
     if args.url:
         process_single_feed(args.url)
-    
     elif args.file:
         file_path = Path(args.file)
-        if not file_path.exists():
-            print(f"Finner ikke filen: {args.file}")
-            return
-        
-        print(f"Leser podkaster fra {args.file}...")
-        with open(file_path, "r") as f:
-            urls = [line.strip() for line in f if line.strip()]
-        
-        for i, url in enumerate(urls):
-            print(f"\n[{i+1}/{len(urls)}] Starter ny feed...")
-            process_single_feed(url)
-            
+        if file_path.exists():
+            with open(file_path, "r") as f:
+                urls = [line.strip() for line in f if line.strip()]
+            for url in urls:
+                process_single_feed(url)
     else:
-        # Fallback: Sjekk .env for gammelt oppsett
-        env_url = os.getenv("RSS_URL")
-        if env_url:
-            print("Bruker RSS_URL fra .env...")
-            process_single_feed(env_url)
-        else:
-            print("Du må oppgi enten --url eller --file.")
-            print("Eksempel: python src/download_podcast.py --url https://feed.com/rss")
+        print("Bruk --url eller --file.")
 
-    # Rydd opp temp-mappen til slutt
     if TEMP_DIR.exists() and not any(TEMP_DIR.iterdir()):
         TEMP_DIR.rmdir()
-    print("\nFerdig!")
 
 if __name__ == "__main__":
     main()
