@@ -2,4 +2,6 @@ pandas
 python-dotenv
 torchaudio
 boto3
+requests
+feedparser
 git+https://github.com/m-bain/whisperx.git
