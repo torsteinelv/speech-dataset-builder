@@ -4,6 +4,7 @@ import json
 import torch
 import whisperx
 import pandas as pd
+import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -13,25 +14,68 @@ load_dotenv()
 # --- KONFIGURASJON ---
 INPUT_DIR = Path("/app/input")
 OUTPUT_DIR = Path("/app/output")
+MODEL_CACHE_DIR = Path("/app/output/models") # Vi lagrer modellen på disken så vi slipper å konvertere hver gang
 HF_TOKEN = os.getenv("HF_TOKEN")
 DEVICE = "cuda"
-BATCH_SIZE = 32         # Økt for 20GB VRAM
+BATCH_SIZE = 32         
 COMPUTE_TYPE = "float16" 
+
+# Valg av modell: Her bruker vi NbAiLab sin
+NBAILAB_MODEL_ID = "NbAiLab/nb-whisper-large" 
 
 # Filter-innstillinger
 MIN_CONFIDENCE = 0.90   
 BUFFER_ZONE = 0.5       
 MIN_DURATION = 1.5      
-NUM_SPEAKERS = 3        # Sett til None hvis det varierer
+NUM_SPEAKERS = 3        
+
+def get_norwegian_model_path():
+    """
+    Sjekker om NbAiLab-modellen finnes i CT2-format.
+    Hvis ikke, laster den ned og konverterer den automatisk.
+    """
+    model_name_safe = NBAILAB_MODEL_ID.replace("/", "_")
+    ct2_output_dir = MODEL_CACHE_DIR / f"{model_name_safe}_ct2"
+
+    if ct2_output_dir.exists():
+        print(f"--- Fant ferdig konvertert modell: {ct2_output_dir} ---")
+        return str(ct2_output_dir)
+    
+    print(f"--- Fant ingen konvertert modell. Laster ned og konverterer {NBAILAB_MODEL_ID}... ---")
+    print("Dette tar litt tid første gang (ca. 2-5 minutter).")
+    
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Kommando for å konvertere fra HuggingFace til CTranslate2 (WhisperX format)
+    # Vi kjører dette som en subprocess
+    cmd = [
+        "ct2-transformers-converter",
+        "--model", NBAILAB_MODEL_ID,
+        "--output_dir", str(ct2_output_dir),
+        "--quantization", COMPUTE_TYPE,
+        "--low_cpu_mem_usage"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+        print("--- Konvertering vellykket! ---")
+        return str(ct2_output_dir)
+    except subprocess.CalledProcessError as e:
+        print(f"FEIL under modell-konvertering: {e}")
+        print("Faller tilbake til standard 'large-v3' modell fra OpenAI.")
+        return "large-v3"
 
 def process_audio():
-    # Sjekk at vi har token
     if not HF_TOKEN:
         raise ValueError("Mangler HF_TOKEN i .env filen!")
 
-    # 1. Last modeller
-    print("--- Laster modeller (WhisperX Large-v3) ---")
-    model = whisperx.load_model("large-v3", DEVICE, compute_type=COMPUTE_TYPE, language="no")
+    # 1. Hent riktig modell (NbAiLab eller fallback)
+    model_path = get_norwegian_model_path()
+    
+    print(f"--- Laster modell fra: {model_path} ---")
+    # Merk: Når vi laster en lokal path, trenger vi ikke 'language' argumentet i load_model, 
+    # men vi setter det i transcribe()
+    model = whisperx.load_model(model_path, DEVICE, compute_type=COMPUTE_TYPE, language="no")
     
     files = list(INPUT_DIR.glob("*.mp3"))
     print(f"Fant {len(files)} filer i input-mappen.")
@@ -49,10 +93,11 @@ def process_audio():
         try:
             # A. Transkribering
             audio = whisperx.load_audio(str(file_path))
-            result = model.transcribe(audio, batch_size=BATCH_SIZE)
+            # VIKTIG: Sett language="no" eksplisitt her
+            result = model.transcribe(audio, batch_size=BATCH_SIZE, language="no")
 
             # B. Alignment
-            model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=DEVICE)
+            model_a, metadata = whisperx.load_align_model(language_code="no", device=DEVICE)
             result = whisperx.align(result["segments"], model_a, metadata, audio, DEVICE, return_char_alignments=False)
             del model_a, metadata
             gc.collect()
@@ -80,15 +125,11 @@ def process_audio():
         except Exception as e:
             print(f"FEIL på fil {filename}: {e}")
 
-        # Tøm GPU fullstendig før neste fil
         gc.collect()
         torch.cuda.empty_cache()
 
 def filter_data(result, diarize_segments, filename):
-    """
-    Filtrerer bort overlapp, støy og korte setninger.
-    """
-    # 1. Finn overlappende soner
+    # (Samme filtrerings-kode som før - ingen endringer her)
     bad_zones = []
     df = pd.DataFrame(diarize_segments)
     if not df.empty:
@@ -106,7 +147,6 @@ def filter_data(result, diarize_segments, filename):
         if "speaker" not in seg: continue
         if (seg["end"] - seg["start"]) < MIN_DURATION: continue
 
-        # Sjekk overlapp
         is_bad = False
         for b_start, b_end in bad_zones:
             if (seg["start"] < b_end) and (seg["end"] > b_start):
@@ -114,7 +154,6 @@ def filter_data(result, diarize_segments, filename):
                 break
         if is_bad: continue
 
-        # Sjekk score
         words = seg.get("words", [])
         if not words: continue
         avg_score = sum(w.get("score", 0) for w in words) / len(words)
