@@ -5,6 +5,7 @@ import torch
 import whisperx
 import pandas as pd
 import subprocess
+import boto3
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -12,42 +13,52 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- KONFIGURASJON ---
-INPUT_DIR = Path("/app/input")
-OUTPUT_DIR = Path("/app/output")
-MODEL_CACHE_DIR = Path("/app/output/models") # Vi lagrer modellen på disken så vi slipper å konvertere hver gang
-HF_TOKEN = os.getenv("HF_TOKEN")
+# S3 / Ceph Config
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL") # VIKTIG FOR CEPH!
+S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_INPUT_PREFIX = "raw/"       # Mappen i bøtta der MP3-filene ligger
+S3_OUTPUT_PREFIX = "dataset/"  # Mappen i bøtta der ferdig JSONL havner
+
+# Modell Config
+NBAILAB_MODEL_ID = "NbAiLab/nb-whisper-large"
 DEVICE = "cuda"
 BATCH_SIZE = 32         
 COMPUTE_TYPE = "float16" 
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Valg av modell: Her bruker vi NbAiLab sin
-NBAILAB_MODEL_ID = "NbAiLab/nb-whisper-large" 
-
-# Filter-innstillinger
+# Filter Config
 MIN_CONFIDENCE = 0.90   
 BUFFER_ZONE = 0.5       
 MIN_DURATION = 1.5      
 NUM_SPEAKERS = 3        
 
+# Lokale stier (Midlertidig lagring)
+LOCAL_TEMP_DIR = Path("/tmp/processing")
+MODEL_CACHE_DIR = Path("/app/models")
+
+def get_s3_client():
+    """Oppretter tilkobling til Ceph S3"""
+    return boto3.client(
+        's3',
+        endpoint_url=S3_ENDPOINT, # Her er magien for Ceph
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY
+    )
+
 def get_norwegian_model_path():
-    """
-    Sjekker om NbAiLab-modellen finnes i CT2-format.
-    Hvis ikke, laster den ned og konverterer den automatisk.
-    """
+    """Sjekker/Konverterer NbAiLab-modellen til WhisperX format"""
     model_name_safe = NBAILAB_MODEL_ID.replace("/", "_")
     ct2_output_dir = MODEL_CACHE_DIR / f"{model_name_safe}_ct2"
 
     if ct2_output_dir.exists():
-        print(f"--- Fant ferdig konvertert modell: {ct2_output_dir} ---")
+        print(f"--- Fant bufret modell: {ct2_output_dir} ---")
         return str(ct2_output_dir)
     
-    print(f"--- Fant ingen konvertert modell. Laster ned og konverterer {NBAILAB_MODEL_ID}... ---")
-    print("Dette tar litt tid første gang (ca. 2-5 minutter).")
-    
+    print(f"--- Laster ned og konverterer {NBAILAB_MODEL_ID}... ---")
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Kommando for å konvertere fra HuggingFace til CTranslate2 (WhisperX format)
-    # Vi kjører dette som en subprocess
     cmd = [
         "ct2-transformers-converter",
         "--model", NBAILAB_MODEL_ID,
@@ -55,81 +66,102 @@ def get_norwegian_model_path():
         "--quantization", COMPUTE_TYPE,
         "--low_cpu_mem_usage"
     ]
-    
     try:
         subprocess.run(cmd, check=True)
-        print("--- Konvertering vellykket! ---")
         return str(ct2_output_dir)
-    except subprocess.CalledProcessError as e:
-        print(f"FEIL under modell-konvertering: {e}")
-        print("Faller tilbake til standard 'large-v3' modell fra OpenAI.")
+    except Exception as e:
+        print(f"Modell-konvertering feilet ({e}). Bruker standard 'large-v3'.")
         return "large-v3"
 
 def process_audio():
-    if not HF_TOKEN:
-        raise ValueError("Mangler HF_TOKEN i .env filen!")
+    if not HF_TOKEN: raise ValueError("Mangler HF_TOKEN!")
+    if not S3_BUCKET: raise ValueError("Mangler S3_BUCKET!")
 
-    # 1. Hent riktig modell (NbAiLab eller fallback)
-    model_path = get_norwegian_model_path()
+    # 1. Klargjør
+    LOCAL_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    s3 = get_s3_client()
     
-    print(f"--- Laster modell fra: {model_path} ---")
-    # Merk: Når vi laster en lokal path, trenger vi ikke 'language' argumentet i load_model, 
-    # men vi setter det i transcribe()
+    # 2. Last modell
+    model_path = get_norwegian_model_path()
+    print(f"--- Laster WhisperX med modell: {model_path} ---")
     model = whisperx.load_model(model_path, DEVICE, compute_type=COMPUTE_TYPE, language="no")
     
-    files = list(INPUT_DIR.glob("*.mp3"))
-    print(f"Fant {len(files)} filer i input-mappen.")
+    # 3. Finn filer i Ceph
+    print(f"Lister filer i s3://{S3_BUCKET}/{S3_INPUT_PREFIX}...")
+    try:
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_INPUT_PREFIX)
+    except Exception as e:
+        print(f"Klarte ikke koble til S3: {e}")
+        return
 
-    for i, file_path in enumerate(files):
-        filename = file_path.name
-        output_path = OUTPUT_DIR / f"{file_path.stem}.jsonl"
+    if 'Contents' not in response:
+        print("Ingen filer funnet i raw-mappen.")
+        return
 
-        if output_path.exists():
+    all_files = [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.mp3')]
+    print(f"Fant {len(all_files)} mp3-filer som skal prosesseres.")
+
+    # 4. Prosesser hver fil
+    for i, s3_key in enumerate(all_files):
+        filename = Path(s3_key).name
+        result_key = f"{S3_OUTPUT_PREFIX}{filename.replace('.mp3', '.jsonl')}"
+        
+        # Sjekk om ferdig (Resume capability)
+        try:
+            s3.head_object(Bucket=S3_BUCKET, Key=result_key)
             print(f"Skipper {filename} (allerede ferdig).")
             continue
+        except:
+            pass 
 
-        print(f"\nProsesserer {i+1}/{len(files)}: {filename}...")
+        print(f"\n[{i+1}/{len(all_files)}] Laster ned {filename}...")
+        local_mp3 = LOCAL_TEMP_DIR / filename
+        local_json = LOCAL_TEMP_DIR / f"{filename}.jsonl"
 
         try:
-            # A. Transkribering
-            audio = whisperx.load_audio(str(file_path))
-            # VIKTIG: Sett language="no" eksplisitt her
+            # A. Last ned
+            s3.download_file(S3_BUCKET, s3_key, str(local_mp3))
+
+            # B. Transkriber
+            audio = whisperx.load_audio(str(local_mp3))
             result = model.transcribe(audio, batch_size=BATCH_SIZE, language="no")
 
-            # B. Alignment
+            # C. Align
             model_a, metadata = whisperx.load_align_model(language_code="no", device=DEVICE)
             result = whisperx.align(result["segments"], model_a, metadata, audio, DEVICE, return_char_alignments=False)
             del model_a, metadata
-            gc.collect()
-            torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache()
 
-            # C. Diarization
+            # D. Diarize
             diarize_model = whisperx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=DEVICE)
             diarize_segments = diarize_model(audio, min_speakers=NUM_SPEAKERS, max_speakers=NUM_SPEAKERS)
             result = whisperx.assign_word_speakers(diarize_segments, result)
             del diarize_model
-            gc.collect()
-            torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache()
 
-            # D. Avansert Filtrering
+            # E. Filtrer og Lagre
             clean_data = filter_data(result, diarize_segments, filename)
-
-            # E. Lagring
-            with open(output_path, "w", encoding="utf-8") as f:
+            
+            with open(local_json, "w", encoding="utf-8") as f:
                 for entry in clean_data:
                     json.dump(entry, f, ensure_ascii=False)
                     f.write("\n")
-            
-            print(f"Ferdig! Lagret {len(clean_data)} rene setninger.")
+
+            # F. Last opp til Ceph
+            print(f"Laster opp resultat til {result_key}...")
+            s3.upload_file(str(local_json), S3_BUCKET, result_key)
 
         except Exception as e:
-            print(f"FEIL på fil {filename}: {e}")
-
-        gc.collect()
-        torch.cuda.empty_cache()
+            print(f"FEIL på {filename}: {e}")
+        
+        finally:
+            # Rydd opp disk
+            if local_mp3.exists(): local_mp3.unlink()
+            if local_json.exists(): local_json.unlink()
+            gc.collect(); torch.cuda.empty_cache()
 
 def filter_data(result, diarize_segments, filename):
-    # (Samme filtrerings-kode som før - ingen endringer her)
+    """Vasker dataene for støy og overlapp"""
     bad_zones = []
     df = pd.DataFrame(diarize_segments)
     if not df.empty:
@@ -147,6 +179,7 @@ def filter_data(result, diarize_segments, filename):
         if "speaker" not in seg: continue
         if (seg["end"] - seg["start"]) < MIN_DURATION: continue
 
+        # Sjekk overlapp
         is_bad = False
         for b_start, b_end in bad_zones:
             if (seg["start"] < b_end) and (seg["end"] > b_start):
@@ -154,6 +187,7 @@ def filter_data(result, diarize_segments, filename):
                 break
         if is_bad: continue
 
+        # Sjekk confidence
         words = seg.get("words", [])
         if not words: continue
         avg_score = sum(w.get("score", 0) for w in words) / len(words)
@@ -167,7 +201,6 @@ def filter_data(result, diarize_segments, filename):
             "end": seg["end"],
             "score": round(avg_score, 3)
         })
-    
     return clean_segments
 
 if __name__ == "__main__":
