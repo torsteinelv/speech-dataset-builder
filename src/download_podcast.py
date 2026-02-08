@@ -3,20 +3,20 @@ import requests
 import os
 import re
 import boto3
+import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- KONFIGURASJON ---
-RSS_URL = os.getenv("RSS_URL")
+# Vi henter ikke lenger RSS_URL fast fra .env, men tar det som parameter
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_BASE_FOLDER = "raw/"  # Rot-mappen for all lyd
+S3_BASE_FOLDER = "raw/" 
 
-# Temp mappe lokalt
 TEMP_DIR = Path("temp_downloads")
 
 def get_s3_client():
@@ -28,29 +28,31 @@ def get_s3_client():
     )
 
 def clean_filename(title):
-    # Fjerner ugyldige tegn, erstatter mellomrom med understrek
     cleaned = re.sub(r'[\\/*?:"<>|]', "", title)
     return cleaned.strip().replace(" ", "_")
 
-def download_and_upload():
-    if not RSS_URL or not S3_BUCKET:
-        print("FEIL: Mangler RSS_URL eller S3_BUCKET i .env")
+def process_single_feed(rss_url):
+    """Laster ned og laster opp episoder fra én RSS-feed"""
+    if not S3_BUCKET:
+        print("FEIL: Mangler S3_BUCKET i .env")
         return
 
     s3 = get_s3_client()
     TEMP_DIR.mkdir(exist_ok=True)
 
-    print(f"Henter RSS: {RSS_URL} ...")
-    feed = feedparser.parse(RSS_URL)
-
-    if not feed.entries:
-        print("Fant ingen episoder.")
+    print(f"--- Behandler RSS: {rss_url} ---")
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as e:
+        print(f"Klarte ikke lese RSS: {e}")
         return
 
-    # Bruk podcast-tittel som mappenavn
+    if not feed.entries:
+        print("Fant ingen episoder eller ugyldig RSS.")
+        return
+
     podcast_title = clean_filename(feed.feed.get('title', 'Ukjent_Podcast'))
-    print(f"Podcast: {podcast_title}")
-    print(f"Fant {len(feed.entries)} episoder.")
+    print(f"Podcast: {podcast_title} ({len(feed.entries)} episoder)")
 
     for entry in feed.entries:
         episode_title = clean_filename(entry.title)
@@ -64,15 +66,13 @@ def download_and_upload():
         if not mp3_url: continue
 
         filename = f"{episode_title}.mp3"
-        
-        # Struktur: raw/PodkastNavn/Episode.mp3
         s3_key = f"{S3_BASE_FOLDER}{podcast_title}/{filename}"
         local_path = TEMP_DIR / filename
 
-        # Sjekk om filen finnes i S3
+        # Sjekk S3
         try:
             s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            print(f"SKIP (Finnes): {podcast_title}/{filename}")
+            # print(f"SKIP (Finnes): {filename}") # Kommenter ut hvis du vil ha mindre spam
             continue
         except:
             pass 
@@ -94,9 +94,49 @@ def download_and_upload():
         finally:
             if local_path.exists(): local_path.unlink()
 
+def main():
+    parser = argparse.ArgumentParser(description="Last ned podkaster til S3.")
+    
+    # Valg 1: En enkelt URL
+    parser.add_argument("--url", type=str, help="URL til én RSS feed")
+    
+    # Valg 2: En fil med mange URLer
+    parser.add_argument("--file", type=str, help="Tekstfil med liste over RSS feeder (én per linje)")
+
+    args = parser.parse_args()
+
+    # Logikk for hva vi skal gjøre
+    if args.url:
+        process_single_feed(args.url)
+    
+    elif args.file:
+        file_path = Path(args.file)
+        if not file_path.exists():
+            print(f"Finner ikke filen: {args.file}")
+            return
+        
+        print(f"Leser podkaster fra {args.file}...")
+        with open(file_path, "r") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        
+        for i, url in enumerate(urls):
+            print(f"\n[{i+1}/{len(urls)}] Starter ny feed...")
+            process_single_feed(url)
+            
+    else:
+        # Fallback: Sjekk .env for gammelt oppsett
+        env_url = os.getenv("RSS_URL")
+        if env_url:
+            print("Bruker RSS_URL fra .env...")
+            process_single_feed(env_url)
+        else:
+            print("Du må oppgi enten --url eller --file.")
+            print("Eksempel: python src/download_podcast.py --url https://feed.com/rss")
+
+    # Rydd opp temp-mappen til slutt
     if TEMP_DIR.exists() and not any(TEMP_DIR.iterdir()):
         TEMP_DIR.rmdir()
     print("\nFerdig!")
 
 if __name__ == "__main__":
-    download_and_upload()
+    main()
