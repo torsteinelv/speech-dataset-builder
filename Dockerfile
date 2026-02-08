@@ -4,10 +4,13 @@ FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
 # Sett arbeidsmappe
 WORKDIR /app
 
-# Installer systemavhengigheter (git og ffmpeg er kritiske)
-RUN apt-get update && apt-get install -y \
+# VIKTIG ENDRING HER:
+# Vi setter DEBIAN_FRONTEND=noninteractive for å unngå at tzdata stopper bygget
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git \
     ffmpeg \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Kopier requirements og installer python-pakker
