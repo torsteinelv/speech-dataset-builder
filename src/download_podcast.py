@@ -6,19 +6,17 @@ import boto3
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Last inn miljøvariabler
 load_dotenv()
 
 # --- KONFIGURASJON ---
 RSS_URL = os.getenv("RSS_URL")
-# S3 / Ceph Config
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_Target_Folder = "raw/"  # Mappen i S3 der filene skal ligge
+S3_BASE_FOLDER = "raw/"  # Rot-mappen for all lyd
 
-# Midlertidig mappe for nedlasting før opplasting
+# Temp mappe
 TEMP_DIR = Path("temp_downloads")
 
 def get_s3_client():
@@ -30,81 +28,79 @@ def get_s3_client():
     )
 
 def clean_filename(title):
-    # Rens filnavn for ulovlige tegn og mellomrom
+    # Fjerner ugyldige tegn og mellomrom
     cleaned = re.sub(r'[\\/*?:"<>|]', "", title)
-    return cleaned.strip()
+    return cleaned.strip().replace(" ", "_") # Bytter mellomrom med understrek for sikkerhets skyld
 
 def download_and_upload():
     if not RSS_URL or not S3_BUCKET:
-        print("FEIL: Mangler RSS_URL eller S3_BUCKET i .env filen.")
+        print("FEIL: Mangler RSS_URL eller S3_BUCKET i .env")
         return
 
     s3 = get_s3_client()
     TEMP_DIR.mkdir(exist_ok=True)
 
-    print(f"Henter podcast-liste fra: {RSS_URL} ...")
+    print(f"Henter RSS: {RSS_URL} ...")
     feed = feedparser.parse(RSS_URL)
 
     if not feed.entries:
         print("Fant ingen episoder.")
         return
 
-    print(f"Fant {len(feed.entries)} episoder. Sjekker mot S3...")
+    # 1. Hent og vask podcast-navnet for å bruke som mappenavn
+    podcast_title = clean_filename(feed.feed.get('title', 'Ukjent_Podcast'))
+    print(f"Podcast: {podcast_title}")
+    print(f"Fant {len(feed.entries)} episoder.")
 
     for entry in feed.entries:
-        title = clean_filename(entry.title)
+        episode_title = clean_filename(entry.title)
         
-        # Finn mp3-lenke
         mp3_url = None
         for link in entry.links:
             if link.rel == 'enclosure' and 'audio' in link.type:
                 mp3_url = link.href
                 break
         
-        if not mp3_url:
-            continue
+        if not mp3_url: continue
 
-        filename = f"{title}.mp3"
-        s3_key = f"{S3_Target_Folder}{filename}"
+        filename = f"{episode_title}.mp3"
+        
+        # HER ER MAGIEN: Vi legger podcast-navnet inn i stien
+        # Resultat: raw/Min_Podcast/Min_Episode.mp3
+        s3_key = f"{S3_BASE_FOLDER}{podcast_title}/{filename}"
+        
         local_path = TEMP_DIR / filename
 
-        # 1. SJEKK OM FILEN ALLEREDE FINNES I S3
+        # Sjekk om filen finnes i S3 (så vi slipper å laste ned på nytt)
         try:
             s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            print(f"SKIP (Finnes i S3): {title}")
+            print(f"SKIP (Finnes): {podcast_title}/{filename}")
             continue
         except:
-            # Filen finnes ikke i S3, så vi fortsetter
-            pass
+            pass # Filen finnes ikke, fortsett
 
-        # 2. LAST NED LOKALT
-        print(f"LASTER NED: {title} ...")
+        print(f"LASTER NED: {episode_title} ...")
         try:
-            response = requests.get(mp3_url, stream=True)
-            response.raise_for_status()
+            # Last ned lokalt først
+            with requests.get(mp3_url, stream=True) as r:
+                r.raise_for_status()
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
             
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # 3. LAST OPP TIL S3
-            print(f" -> Laster opp til s3://{S3_BUCKET}/{s3_key} ...")
+            # Last opp til riktig undermappe i S3
+            print(f" -> Laster opp til: {s3_key}")
             s3.upload_file(str(local_path), S3_BUCKET, s3_key)
-            print(" -> Ferdig!")
 
         except Exception as e:
             print(f" -> FEILET: {e}")
         
         finally:
-            # 4. RYDD OPP (Slett lokal fil)
-            if local_path.exists():
-                local_path.unlink()
+            if local_path.exists(): local_path.unlink()
 
-    # Fjern temp-mappen til slutt
     if TEMP_DIR.exists() and not any(TEMP_DIR.iterdir()):
         TEMP_DIR.rmdir()
-
-    print("\nAlle nye episoder er lastet opp til S3!")
+    print("\nFerdig!")
 
 if __name__ == "__main__":
     download_and_upload()
