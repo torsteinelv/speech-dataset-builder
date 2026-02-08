@@ -20,7 +20,7 @@ S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
 S3_TARGET_ROOT = f"{S3_BASE_PATH}/raw/" 
 
-# Navnet på filen i S3 som holder oversikten
+# Filen som holder oversikten
 SUBSCRIPTION_FILE_KEY = f"{S3_TARGET_ROOT}subscriptions.txt"
 
 TEMP_DIR = Path("temp_downloads")
@@ -49,7 +49,6 @@ def load_subscriptions(s3):
         print(f"--- Hentet {len(urls)} abonnementer fra S3 ---")
         return urls
     except s3.exceptions.NoSuchKey:
-        print("--- Ingen abonnementer funnet i S3 (ny fil vil bli opprettet) ---")
         return set()
     except Exception as e:
         print(f"Advarsel: Kunne ikke lese subscriptions.txt: {e}")
@@ -60,7 +59,8 @@ def save_subscription(s3, new_url):
     current_urls = load_subscriptions(s3)
     
     if new_url in current_urls:
-        return # URLen finnes allerede, trenger ikke gjøre noe
+        print(f"--- Podkasten er allerede i listen ---")
+        return 
 
     current_urls.add(new_url)
     
@@ -68,7 +68,7 @@ def save_subscription(s3, new_url):
     file_content = "\n".join(sorted(current_urls))
     try:
         s3.put_object(Bucket=S3_BUCKET, Key=SUBSCRIPTION_FILE_KEY, Body=file_content.encode('utf-8'))
-        print(f"--- Lagret ny podkast i listen på S3 ---")
+        print(f"--- LAGRET NY PODKAST I S3-LISTEN: {new_url} ---")
     except Exception as e:
         print(f"FEIL: Klarte ikke oppdatere abonnement-listen i S3: {e}")
 
@@ -141,34 +141,34 @@ def main():
 
     s3 = get_s3_client()
 
-    # SCENARIO 1: Brukeren vil legge til en ny podcast
+    # SCENARIO 1: Ny podcast
     if args.url:
         print(f"Starter behandling av ny podcast...")
-        process_single_feed(args.url, s3)
+        # VIKTIG: Vi lagrer abonnementet FØR vi begynner å laste ned episodene
         save_subscription(s3, args.url)
+        process_single_feed(args.url, s3)
     
-    # SCENARIO 2: Brukeren vil importere fra fil
+    # SCENARIO 2: Import fra fil
     elif args.file:
         file_path = Path(args.file)
         if file_path.exists():
             with open(file_path, "r") as f:
                 urls = [line.strip() for line in f if line.strip()]
             for url in urls:
-                process_single_feed(url, s3)
-                save_subscription(s3, url)
+                save_subscription(s3, url) # Lagrer først
+                process_single_feed(url, s3) # Så laster vi ned
     
-    # SCENARIO 3: Ingen argumenter - oppdater alle abonnementer
+    # SCENARIO 3: Oppdater eksisterende
     else:
         saved_urls = load_subscriptions(s3)
         if not saved_urls:
-            print("Ingen lagrede podkaster funnet.")
+            print("Ingen lagrede podkaster funnet i S3.")
             print("Bruk --url '...' for å legge til den første!")
         else:
             print(f"Sjekker {len(saved_urls)} lagrede podkaster for nye episoder...")
             for url in saved_urls:
                 process_single_feed(url, s3)
 
-    # Rydd opp
     if TEMP_DIR.exists() and not any(TEMP_DIR.iterdir()):
         TEMP_DIR.rmdir()
     print("\nFerdig!")
