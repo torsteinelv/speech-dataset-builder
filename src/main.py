@@ -11,28 +11,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- KONFIGURASJON ---
+# --- S3 KONFIGURASJON ---
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL")
 S3_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_INPUT_PREFIX = "raw/"
-S3_OUTPUT_PREFIX = "dataset/"
 
-# Modell & Hardware
+# --- PROSJEKT STIER ---
+base_path = os.getenv("S3_BASE_PATH", "002_speech_dataset")
+S3_INPUT_PREFIX = f"{base_path}/raw/"
+S3_OUTPUT_PREFIX = f"{base_path}/processed/"
+
+# --- MODELL & HARDWARE ---
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "NbAiLab/nb-whisper-large") 
 DEVICE = os.getenv("DEVICE", "cuda")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 32))
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Filter
+# --- FILTER ---
 MIN_CONFIDENCE = 0.90   
 BUFFER_ZONE = 0.5       
 MIN_DURATION = 1.5      
 NUM_SPEAKERS = 3        
 
-# Stier
 LOCAL_TEMP_DIR = Path("temp_processing")
 MODEL_CACHE_DIR = Path("models_cache")
 
@@ -45,9 +47,7 @@ def get_s3_client():
     )
 
 def get_model_path():
-    """Håndterer nedlasting og konvertering av modell."""
     if "/" not in WHISPER_MODEL:
-        print(f"--- Bruker standardmodell: {WHISPER_MODEL} ---")
         return WHISPER_MODEL
 
     model_name_safe = WHISPER_MODEL.replace("/", "_")
@@ -57,7 +57,7 @@ def get_model_path():
         print(f"--- Fant bufret modell: {ct2_output_dir} ---")
         return str(ct2_output_dir)
     
-    print(f"--- Konverterer {WHISPER_MODEL} (Dette tar tid)... ---")
+    print(f"--- Konverterer {WHISPER_MODEL}... ---")
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     
     cmd = [
@@ -82,12 +82,11 @@ def process_audio():
     s3 = get_s3_client()
     
     model_path = get_model_path()
-    print(f"--- Initialiserer WhisperX ({DEVICE}, {COMPUTE_TYPE}) ---")
+    print(f"--- Initialiserer WhisperX ({DEVICE}) ---")
+    print(f"--- Prosjekt: {base_path} ---")
     
-    # Last modell
     model = whisperx.load_model(model_path, DEVICE, compute_type=COMPUTE_TYPE, language="no")
     
-    # List filer REKURSIVT i raw-mappen
     print(f"Lister filer i s3://{S3_BUCKET}/{S3_INPUT_PREFIX}...")
     try:
         response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_INPUT_PREFIX)
@@ -103,10 +102,10 @@ def process_audio():
     print(f"Fant {len(all_files)} mp3-filer.")
 
     for i, s3_key in enumerate(all_files):
-        # Beregn stier med undermapper
-        # raw/Podcast/ep.mp3 -> Podcast/ep.mp3
+        # Beregn relative stier
+        # Input:  002_speech_dataset/raw/Podcast/ep.mp3
+        # Output: 002_speech_dataset/processed/Podcast/ep.jsonl
         relative_path = s3_key.replace(S3_INPUT_PREFIX, "", 1)
-        # dataset/Podcast/ep.jsonl
         result_key = f"{S3_OUTPUT_PREFIX}{relative_path.replace('.mp3', '.jsonl')}"
         filename = Path(s3_key).name
 
@@ -124,26 +123,21 @@ def process_audio():
         try:
             s3.download_file(S3_BUCKET, s3_key, str(local_mp3))
 
-            # Transkriber
             audio = whisperx.load_audio(str(local_mp3))
             result = model.transcribe(audio, batch_size=BATCH_SIZE, language="no")
 
-            # Align
             model_a, metadata = whisperx.load_align_model(language_code="no", device=DEVICE)
             result = whisperx.align(result["segments"], model_a, metadata, audio, DEVICE, return_char_alignments=False)
             del model_a, metadata
             
-            # Diarize
             if DEVICE == "cuda":
                 diarize_model = whisperx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=DEVICE)
                 diarize_segments = diarize_model(audio, min_speakers=NUM_SPEAKERS, max_speakers=NUM_SPEAKERS)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
                 del diarize_model
             else:
-                print("Advarsel: Kjører på CPU - skipper diarization for test.")
                 diarize_segments = []
 
-            # Filtrer og Lagre
             clean_data = filter_data(result, diarize_segments, relative_path)
             
             with open(local_json, "w", encoding="utf-8") as f:
@@ -164,7 +158,6 @@ def process_audio():
                 gc.collect(); torch.cuda.empty_cache()
 
 def filter_data(result, diarize_segments, source_name):
-    # Hvis ingen diarization (CPU test), returner alt
     if not isinstance(diarize_segments, list) and not hasattr(diarize_segments, 'itertracks'):
          return [{"text": s["text"].strip(), "start": s["start"], "end": s["end"], "speaker": "Unknown", "file": source_name} for s in result["segments"]]
 
