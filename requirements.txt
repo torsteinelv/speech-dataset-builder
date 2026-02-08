@@ -1,0 +1,6 @@
+# PyTorch er allerede i base-imaget, men vi trenger disse:
+pandas
+python-dotenv
+torchaudio
+# Hent siste versjon av WhisperX
+git+https://github.com/m-bain/whisperx.git
