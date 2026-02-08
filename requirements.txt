@@ -1,6 +1,8 @@
 pandas
 python-dotenv
-torchaudio
+# Vi låser torch til en versjon før 2.6 for å unngå weights_only feilen
+torch==2.5.1
+torchaudio==2.5.1
 boto3
 requests
 feedparser
