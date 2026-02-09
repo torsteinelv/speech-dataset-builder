@@ -35,11 +35,19 @@ RUN pip install -r /app/requirements.txt
 # FIX: legg inn cuDNN 8 libs side-by-side UTEN å installere nvidia-cudnn-cu12==8.x
 # (for pakker som forventer libcudnn_ops_infer.so.8)
 # ------------------------------------------------------------
+# Bytt til bash så vi kan bruke set -euo pipefail trygt
+SHELL ["/bin/bash", "-lc"]
+
 ARG CUDNN8_WHEEL_VERSION=8.9.7.29
-RUN mkdir -p /tmp/cudnn8 \
- && pip download --no-deps --extra-index-url https://pypi.nvidia.com \
-      -d /tmp/cudnn8 "nvidia-cudnn-cu12==${CUDNN8_WHEEL_VERSION}" \
- && python - <<'PY'
+
+RUN <<'BASH'
+set -euo pipefail
+
+mkdir -p /tmp/cudnn8
+pip download --no-deps --extra-index-url https://pypi.nvidia.com \
+  -d /tmp/cudnn8 "nvidia-cudnn-cu12==${CUDNN8_WHEEL_VERSION}"
+
+python - <<'PY'
 import glob, os, zipfile, shutil
 
 whls = glob.glob("/tmp/cudnn8/nvidia_cudnn_cu12-*.whl")
@@ -53,12 +61,10 @@ os.makedirs(extract_dir, exist_ok=True)
 with zipfile.ZipFile(whl) as z:
     z.extractall(extract_dir)
 
-# Kopier KUN *.so.8* (ingen libcudnn.so symlinks) for å unngå å forstyrre Torch/cuDNN9
 libs = sorted({
     p for p in glob.glob(os.path.join(extract_dir, "**", "libcudnn*.so.8*"), recursive=True)
     if os.path.isfile(p)
 })
-
 if not libs:
     raise SystemExit("Fant ingen libcudnn*.so.8* inne i cudnn8 wheel")
 
@@ -69,15 +75,21 @@ for p in libs:
     shutil.copy2(p, outdir)
 
 print(f"cuDNN8: kopierte {len(libs)} filer til {outdir}")
-PY \
- && echo "/usr/local/lib/cudnn8" > /etc/ld.so.conf.d/cudnn8.conf \
- && ldconfig \
- && python - <<'PY'
+PY
+
+echo "/usr/local/lib/cudnn8" > /etc/ld.so.conf.d/cudnn8.conf
+ldconfig
+
+python - <<'PY'
 import ctypes
 ctypes.CDLL("libcudnn_ops_infer.so.8")
 print("OK: libcudnn_ops_infer.so.8 kan lastes")
-PY \
- && rm -rf /tmp/cudnn8
+PY
+
+rm -rf /tmp/cudnn8
+BASH
+
+
 
 # ------------------------------------------------------------
 # (Valgfritt, men greit): fjern execstack-flag fra CTranslate2 .so
