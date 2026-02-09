@@ -1,9 +1,6 @@
-# --- VIKTIG FIX: Forhindre Numpy 2.0 som krasjer WhisperX ---
-numpy<2.0
-
 pandas
 python-dotenv
-# Vi låser torch til 2.5.1 for å unngå weights_only feilen i 2.6+
+# Vi beholder torch låst for sikkerhets skyld
 torch==2.5.1
 torchaudio==2.5.1
 boto3
