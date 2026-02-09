@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: speech-dataset-job
+  namespace: dev  # Plassert i dev namespace
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: processor
+        image: ghcr.io/torsteinelv/speech-dataset-builder:latest
+        imagePullPolicy: Always
+        env:
+        # S3 konfigurasjon hentet fra Secret i samme namespace
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: speech-dataset-secrets
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: speech-dataset-secrets
+              key: AWS_SECRET_ACCESS_KEY
+        - name: S3_ENDPOINT_URL
+          valueFrom:
+            secretKeyRef:
+              name: speech-dataset-secrets
+              key: S3_ENDPOINT_URL
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: speech-dataset-secrets
+              key: S3_BUCKET
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: speech-dataset-secrets
+              key: HF_TOKEN
+
+        # Prosjektinnstillinger
+        - name: S3_BASE_PATH
+          value: "002_speech_dataset"
+        - name: WHISPER_MODEL
+          value: "NbAiLab/nb-whisper-large"
+        - name: DEVICE
+          value: "cuda"
+        - name: COMPUTE_TYPE
+          value: "float16"
+        - name: BATCH_SIZE
+          value: "32"
+
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
