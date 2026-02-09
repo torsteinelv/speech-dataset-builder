@@ -1,6 +1,6 @@
 # Vi hopper helt frem til Ubuntu 24.04 og CUDA 12.4.1
 # Dette er optimalt for RTX 4000 Ada-serien.
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
 
 WORKDIR /app
 
