@@ -20,14 +20,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools && \
     pip install --no-cache-dir -r requirements.txt
 
-# --- SIKKERHETS-PATCH (Execstack) ---
-# Selv på proffe images kan CTranslate2 krangle med Kubernetes sikkerhet.
-# Vi kjører denne under bygging for å være 100% sikre.
-RUN LIB_FILE=$(find /opt/conda/lib/python3.10/site-packages -name "libctranslate2*.so*" | head -n 1) && \
-    if [ -n "$LIB_FILE" ]; then \
-        echo "Patcher $LIB_FILE"; \
-        scanelf --clear-execstack "$LIB_FILE"; \
-    fi
+
 
 COPY src/ ./src/
 
