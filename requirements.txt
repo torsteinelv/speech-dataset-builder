@@ -6,4 +6,4 @@ torchaudio==2.5.1
 boto3
 requests
 feedparser
-git+https://github.com/m-bain/whisperx.git
+whisperx
