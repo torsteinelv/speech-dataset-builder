@@ -1,23 +1,25 @@
-# Bruk et rent, lett Python-image i stedet for det gamle PyTorch-imaget
-FROM python:3.10-slim
+# Vi bytter til 'bullseye' fordi den har verktøyet 'execstack' tilgjengelig
+FROM python:3.10-bullseye
 
 WORKDIR /app
 
-# Installer systemavhengigheter (git for whisperx, ffmpeg for lyd)
+# Installer systemavhengigheter + execstack
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git \
     ffmpeg \
     tzdata \
+    execstack \
     && rm -rf /var/lib/apt/lists/*
 
-# Kopier og installer python-pakker
 COPY requirements.txt .
-# Oppgrader pip først for å håndtere moderne wheels korrekt
 RUN pip install --no-cache-dir --upgrade pip setuptools && \
     pip install --no-cache-dir -r requirements.txt
 
-# Kopier kildekoden
+# --- VIKTIG FIX: Fjern "executable stack" kravet fra CTranslate2 ---
+# Dette søker etter biblioteket som feilet og fjerner flagget som Kubernetes blokkerer
+RUN find /usr/local/lib/python3.10/site-packages -name "libctranslate2*.so*" -exec execstack -c {} \;
+
 COPY src/ ./src/
 
 CMD ["python", "src/main.py"]
