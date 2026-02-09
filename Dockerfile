@@ -7,32 +7,38 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/models_cache \
     TRANSFORMERS_CACHE=/models_cache \
-    XDG_CACHE_HOME=/models_cache
+    XDG_CACHE_HOME=/models_cache \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
-    ffmpeg git curl ca-certificates \
-    build-essential pkg-config \
-    libsndfile1 \
-    patchelf \
- && rm -rf /var/lib/apt/lists/*
+      python3 python3-venv python3-pip \
+      ffmpeg git curl ca-certificates \
+      build-essential pkg-config \
+      libsndfile1 \
+      patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# ----
+# FIX PEP 668: bruk virtualenv (pip inni venv er OK)
+# ----
+RUN python3 -m venv "$VIRTUAL_ENV" \
+ && "$VIRTUAL_ENV/bin/python" -m ensurepip --upgrade \
+ && "$VIRTUAL_ENV/bin/python" -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# Installer python deps
+# Installer python deps (inn i venv)
 COPY requirements.txt /app/requirements.txt
-RUN python3 -m pip install --upgrade pip setuptools wheel \
- && python3 -m pip install -r /app/requirements.txt
+RUN pip install -r /app/requirements.txt
 
 # ------------------------------------------------------------
 # FIX: legg inn cuDNN 8 runtime libs side-by-side
 # (for pakker som forventer libcudnn_ops_infer.so.8)
-# Vi installerer via NVIDIA sin pip-index, og kopierer kun *.so.8*
-# til en separat mappe for å unngå å overstyre cuDNN9.
 # ------------------------------------------------------------
-RUN python3 -m pip install --extra-index-url https://pypi.nvidia.com "nvidia-cudnn-cu12==8.9.7.29" \
- && python3 - <<'PY'
+RUN pip install --extra-index-url https://pypi.nvidia.com "nvidia-cudnn-cu12==8.9.7.29" \
+ && python - <<'PY'
 import sysconfig, glob, os, shutil
 
 purelib = sysconfig.get_paths()["purelib"]
@@ -52,7 +58,6 @@ libdir = os.path.dirname(hits[0])
 outdir = "/usr/local/lib/cudnn8"
 os.makedirs(outdir, exist_ok=True)
 
-# Kopier kun cuDNN8-filer (so.8*) til outdir
 copied = 0
 for f in glob.glob(os.path.join(libdir, "libcudnn*.so.8*")):
     if os.path.isfile(f):
@@ -65,12 +70,10 @@ PY \
  && ldconfig
 
 # ------------------------------------------------------------
-# (Valgfritt, men anbefalt): Fjern execstack-flag fra CTranslate2 .so
-# for å unngå 'cannot enable executable stack' på hardnede kernels.
+# (Valgfritt, men ofte nyttig): fjern execstack-flag fra CTranslate2 .so
 # ------------------------------------------------------------
-RUN python3 - <<'PY'
+RUN python - <<'PY'
 import sysconfig, glob, os, subprocess
-
 purelib = sysconfig.get_paths()["purelib"]
 libs = glob.glob(os.path.join(purelib, "**", "libctranslate2*.so*"), recursive=True)
 
@@ -79,19 +82,22 @@ if not libs:
 else:
     patched = 0
     for so in libs:
-        # patchelf returnerer !=0 om det ikke er ELF; vi ignorerer det.
-        subprocess.run(["patchelf", "--clear-execstack", so], check=False,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            ["patchelf", "--clear-execstack", so],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         patched += 1
     print(f"Patchet execstack på {patched} filer")
 PY
 
-# Entrypoint som verifiserer cuDNN8-fila før appen starter
+# Entrypoint (LD_LIBRARY_PATH + sanity check)
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Kopier resten av appen
+# App-kode
 COPY . /app
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python3", "-u", "/app/src/main.py"]
+CMD ["python", "-u", "/app/src/main.py"]
