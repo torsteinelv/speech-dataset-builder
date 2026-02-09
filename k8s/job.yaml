@@ -8,7 +8,13 @@ spec:
   backoffLimit: 2
   template:
     spec:
+
+      nodeSelector:
+        kubernetes.io/hostname: k8s-w1
+
       restartPolicy: OnFailure
+      imagePullSecrets:
+      - name: ghcr-secret
       containers:
       - name: processor
         image: ghcr.io/torsteinelv/speech-dataset-builder:latest
