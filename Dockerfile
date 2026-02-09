@@ -1,8 +1,9 @@
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+# Bruk et rent, lett Python-image i stedet for det gamle PyTorch-imaget
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Hindre tzdata i å spørre om tidssone
+# Installer systemavhengigheter (git for whisperx, ffmpeg for lyd)
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git \
@@ -10,9 +11,13 @@ RUN apt-get update && \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+# Kopier og installer python-pakker
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Oppgrader pip først for å håndtere moderne wheels korrekt
+RUN pip install --no-cache-dir --upgrade pip setuptools && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Kopier kildekoden
 COPY src/ ./src/
 
 CMD ["python", "src/main.py"]
