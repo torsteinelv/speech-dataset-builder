@@ -4,18 +4,18 @@ python-dotenv==1.2.1
 requests==2.32.5
 feedparser==6.0.12
 
-# Core pipeline
+# Core ASR stack
 whisperx==3.4.3
 faster-whisper==1.2.1
 ctranslate2==4.4.0
 
-# Pyannote (pin pga breaks i 4.x med WhisperX)
+# Diarization
 pyannote-audio==3.4.0
 
-# Data / audio
+# Data/audio
 pandas==3.0.0
 soundfile==0.13.1
 
-# Torch (matcher det du allerede kjører med)
+# Torch (GPU)
 torch==2.5.1
 torchaudio==2.5.1
