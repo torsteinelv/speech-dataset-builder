@@ -11,6 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
+# Bruk bash for tryggere heredocs
+SHELL ["/bin/bash", "-lc"]
+
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip \
@@ -27,19 +30,13 @@ RUN python3 -m venv "$VIRTUAL_ENV" \
 
 WORKDIR /app
 
-# Installer python deps i venv
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 # ------------------------------------------------------------
-# FIX: legg inn cuDNN 8 libs side-by-side UTEN å installere nvidia-cudnn-cu12==8.x
-# (for pakker som forventer libcudnn_ops_infer.so.8)
+# cuDNN8 side-by-side (kun .so.8*) uten å avinstallere Torch sin cuDNN9
 # ------------------------------------------------------------
-# Bytt til bash så vi kan bruke set -euo pipefail trygt
-SHELL ["/bin/bash", "-lc"]
-
 ARG CUDNN8_WHEEL_VERSION=8.9.7.29
-
 RUN <<'BASH'
 set -euo pipefail
 
@@ -70,7 +67,6 @@ if not libs:
 
 outdir = "/usr/local/lib/cudnn8"
 os.makedirs(outdir, exist_ok=True)
-
 for p in libs:
     shutil.copy2(p, outdir)
 
@@ -89,16 +85,11 @@ PY
 rm -rf /tmp/cudnn8
 BASH
 
-
-
-# ------------------------------------------------------------
-# (Valgfritt, men greit): fjern execstack-flag fra CTranslate2 .so
-# ------------------------------------------------------------
+# (Valgfritt) fjern execstack-flag på libctranslate2 dersom kernel er hardnet
 RUN python - <<'PY'
 import sysconfig, glob, os, subprocess
 purelib = sysconfig.get_paths()["purelib"]
 libs = glob.glob(os.path.join(purelib, "**", "libctranslate2*.so*"), recursive=True)
-
 patched = 0
 for so in libs:
     subprocess.run(["patchelf", "--clear-execstack", so], check=False,
@@ -107,11 +98,9 @@ for so in libs:
 print(f"Patchet execstack på {patched} filer")
 PY
 
-# Entrypoint
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# App
 COPY . /app
 
 ENTRYPOINT ["/entrypoint.sh"]
