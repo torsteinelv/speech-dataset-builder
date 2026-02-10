@@ -2,25 +2,24 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: speech-dataset-job
-  namespace: dev  # Plassert i dev namespace
+  namespace: dev
 spec:
   ttlSecondsAfterFinished: 86400
   backoffLimit: 2
   template:
     spec:
-
       nodeSelector:
         kubernetes.io/hostname: k8s-w1
 
       restartPolicy: OnFailure
       imagePullSecrets:
       - name: ghcr-secret
+
       containers:
       - name: processor
         image: ghcr.io/torsteinelv/speech-dataset-builder:latest
         imagePullPolicy: Always
         env:
-        # S3 konfigurasjon hentet fra Secret i samme namespace
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
@@ -47,17 +46,27 @@ spec:
               name: speech-dataset-secrets
               key: HF_TOKEN
 
-        # Prosjektinnstillinger
         - name: S3_BASE_PATH
           value: "002_speech_dataset"
+
+        # ✅ Beste “dataset factory”-valg: rask CT2-modell (distil-turbo)
         - name: WHISPER_MODEL
-          value: "NbAiLab/nb-whisper-large"
+          value: "Hexoplon/nb-whisper-large-distil-turbo-beta-ct2"
+        - name: SKIP_CT2_CONVERSION
+          value: "1"
+
         - name: DEVICE
           value: "cuda"
         - name: COMPUTE_TYPE
           value: "float16"
         - name: BATCH_SIZE
           value: "32"
+
+        # (valgfritt – men jeg lar default være på)
+        - name: ENABLE_ALIGNMENT
+          value: "1"
+        - name: ENABLE_DIARIZATION
+          value: "1"
 
         resources:
           limits:
