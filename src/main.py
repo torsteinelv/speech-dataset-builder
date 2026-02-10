@@ -5,7 +5,7 @@ import inspect
 import json
 import os
 import re
-import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,23 +53,25 @@ def is_oom_error(e: Exception) -> bool:
         "out of memory" in msg
         or "cuda failed with error out of memory" in msg
         or "cuda out of memory" in msg
-        or "cublas" in msg and "alloc" in msg
+        or ("cublas" in msg and "alloc" in msg)
     )
 
 
 # -----------------------------
 # HF Hub compat patch:
 # huggingface_hub v1.x bruker "token=" i stedet for "use_auth_token="
-# men pyannote/whisperx i noen stacker sender fortsatt "use_auth_token="
+# mens pyannote/whisperx ofte sender fortsatt "use_auth_token="
+#
+# Viktig: patch må gjelde også moduler som allerede har gjort:
+#   from huggingface_hub import hf_hub_download
 # -----------------------------
 def patch_hf_hub_download_use_auth_token() -> None:
     try:
         import huggingface_hub
-        from huggingface_hub import file_download as hf_file_download
     except Exception:
         return
 
-    # Hvis hf_hub_download fortsatt støtter use_auth_token -> ingen patch
+    # Hvis hf_hub_download fortsatt støtter use_auth_token -> ingen patch nødvendig
     try:
         sig = inspect.signature(huggingface_hub.hf_hub_download)
         if "use_auth_token" in sig.parameters:
@@ -80,6 +82,7 @@ def patch_hf_hub_download_use_auth_token() -> None:
     orig = huggingface_hub.hf_hub_download
 
     def compat_hf_hub_download(*args, **kwargs):
+        # oversett use_auth_token -> token
         if "use_auth_token" in kwargs and "token" not in kwargs:
             tok = kwargs.pop("use_auth_token")
             if tok is True:
@@ -91,17 +94,28 @@ def patch_hf_hub_download_use_auth_token() -> None:
             kwargs["token"] = tok
         return orig(*args, **kwargs)
 
+    # Patch top-level
     huggingface_hub.hf_hub_download = compat_hf_hub_download
+
+    # Patch file_download (mange libs kaller via denne)
     try:
+        from huggingface_hub import file_download as hf_file_download
         hf_file_download.hf_hub_download = compat_hf_hub_download
     except Exception:
         pass
 
-    try:
-        import pyannote.audio.core.pipeline as pa_pipeline
-        pa_pipeline.hf_hub_download = compat_hf_hub_download
-    except Exception:
-        pass
+    # Patch alle allerede-importerte moduler som holder en peker til "orig"
+    # Bruk __dict__ direkte for å unngå __getattr__ sideeffekter/warnings.
+    for m in list(sys.modules.values()):
+        if m is None:
+            continue
+        d = getattr(m, "__dict__", None)
+        if not d:
+            continue
+        # Bytt ut alle referanser til orig (også evt. alias-navn)
+        for k, v in list(d.items()):
+            if v is orig:
+                d[k] = compat_hf_hub_download
 
 
 @dataclass
@@ -132,8 +146,10 @@ class Config:
     # WhisperX steg
     enable_alignment: bool
     align_device: str
+
     enable_diarization: bool
     strict_diarization: bool
+    diarization_device: str
     diarization_model: str
     hf_token: Optional[str]
 
@@ -179,7 +195,7 @@ def cap_batch_size(cfg: Config) -> None:
     if total is None:
         return
 
-    # konservative caps for large models
+    # konservative caps (large modeller trenger mye VRAM)
     if total <= 6:
         cap = 1
     elif total <= 8:
@@ -226,10 +242,11 @@ def load_config() -> Config:
         allow_model_downsize_on_oom=env_bool("ALLOW_MODEL_DOWNSIZE_ON_OOM", "1"),
         allow_cpu_fallback_on_oom=env_bool("ALLOW_CPU_FALLBACK_ON_OOM", "0"),
         enable_alignment=env_bool("ENABLE_ALIGNMENT", "1"),
-        # ✅ viktig: alignment på CPU som default (reduserer GPU OOM)
         align_device=os.getenv("ALIGN_DEVICE", "cpu").strip(),
         enable_diarization=env_bool("ENABLE_DIARIZATION", "1"),
         strict_diarization=env_bool("STRICT_DIARIZATION", "0"),
+        # diarization på CPU som default (stabilt mht VRAM)
+        diarization_device=os.getenv("DIARIZATION_DEVICE", "cpu").strip(),
         diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1").strip(),
         hf_token=hf_token,
         num_speakers=int(os.getenv("NUM_SPEAKERS", "0")),
@@ -323,9 +340,8 @@ def resolve_whisper_model_path(cfg: Config) -> str:
         )
         return cfg.fallback_model
 
-    # hvis du virkelig vil runtime-konvertering kan vi legge det inn igjen, men du ville ha stabilt oppsett.
     print(
-        "ADVARSEL: SKIP_CT2_CONVERSION=0 men runtime-konvertering er deaktivert i denne stabile profilen. "
+        "ADVARSEL: SKIP_CT2_CONVERSION=0 men runtime-konvertering er deaktivert i denne profilen. "
         f"Fallback til '{cfg.fallback_model}'."
     )
     return cfg.fallback_model
@@ -413,14 +429,15 @@ def init_diarization(cfg: Config):
         print("ADVARSEL:", msg)
         return None
 
+    # ✅ viktig: patch må kjøres før Pipeline.from_pretrained
     patch_hf_hub_download_use_auth_token()
 
-    print(f"--- Laster diarization-modell: {cfg.diarization_model} (én gang) ---")
+    print(f"--- Laster diarization-modell: {cfg.diarization_model} (én gang) på {cfg.diarization_device} ---")
     try:
         diarize_model = DiarizationPipeline(
             model_name=cfg.diarization_model,
             use_auth_token=cfg.hf_token,
-            device=cfg.device,
+            device=cfg.diarization_device,
         )
         if getattr(diarize_model, "model", None) is None:
             raise RuntimeError(
@@ -431,9 +448,10 @@ def init_diarization(cfg: Config):
         print("\nADVARSEL: Kunne ikke laste diarization pipeline.")
         print("Årsak:", repr(e))
         print(
-            "\nFor å aktivere diarization må du akseptere vilkår på HF-kontoen som tokenet tilhører:\n"
-            "  - https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-            "Deretter vil diarization fungere automatisk.\n"
+            "\nHvis du nettopp har akseptert tilgang:\n"
+            "  - pass på at HF_TOKEN er fra samme konto som aksepterte vilkårene\n"
+            "  - og at vilkårene er akseptert her:\n"
+            "    https://huggingface.co/pyannote/speaker-diarization-3.1\n"
         )
         if cfg.strict_diarization:
             raise
@@ -442,22 +460,18 @@ def init_diarization(cfg: Config):
 
 
 def compute_type_candidates(primary: str) -> List[str]:
-    out = []
+    out: List[str] = []
     def add(x: str):
         if x and x not in out:
             out.append(x)
-
     add(primary)
-
-    # gode OOM-fallbacks for CT2/faster-whisper
     add("int8_float16")
     add("int8")
-
     return out
 
 
 def batch_candidates(primary: int) -> List[int]:
-    out = []
+    out: List[int] = []
     b = max(1, int(primary))
     while True:
         if b not in out:
@@ -469,19 +483,14 @@ def batch_candidates(primary: int) -> List[int]:
 
 
 def model_downsize_chain(model_id: str) -> List[str]:
-    """
-    Hvis du bruker TheStigh/nb-whisper-<size>-ct2 kan vi auto-downgrade ved OOM:
-      large -> medium -> small -> base -> tiny
-    """
     sizes = ["large", "medium", "small", "base", "tiny"]
     m = re.match(r"^(TheStigh/nb-whisper-)(tiny|base|small|medium|large)(-ct2)$", model_id)
     if not m:
         return [model_id]
-
     prefix, cur, suffix = m.group(1), m.group(2), m.group(3)
     idx = sizes.index(cur)
     chain = [model_id]
-    for s in sizes[idx + 1 :]:
+    for s in sizes[idx + 1:]:
         chain.append(f"{prefix}{s}{suffix}")
     return chain
 
@@ -489,10 +498,10 @@ def model_downsize_chain(model_id: str) -> List[str]:
 class ASRManager:
     def __init__(self, cfg: Config, model_id: str):
         self.cfg = cfg
-        self.device = cfg.device
         self.language = cfg.language
         self.model_id = model_id
         self.compute_type = cfg.compute_type
+        self.device = cfg.device
         self.model = None
         self.load(self.model_id, self.compute_type, self.device)
 
@@ -520,16 +529,14 @@ class ASRManager:
 
         last_err: Optional[Exception] = None
 
-        for midx, m in enumerate(model_chain):
-            for cidx, ct in enumerate(ct_chain):
-                # last inn (eller reload) modellen for denne kombinasjonen
+        for m in model_chain:
+            for ct in ct_chain:
                 if self.model is None or self.model_id != m or self.compute_type != ct or self.device != self.cfg.device:
                     self.load(m, ct, self.cfg.device)
 
                 for b in b_chain:
                     try:
                         res = self.model.transcribe(audio, batch_size=b, language=self.language)
-                        # "lås inn" suksess-parametre for resten av runnet
                         if b != self.cfg.batch_size:
                             print(f"INFO: batch_size justert for stabilitet: {self.cfg.batch_size} -> {b}")
                             self.cfg.batch_size = b
@@ -538,12 +545,10 @@ class ASRManager:
                         last_err = e
                         if is_oom_error(e):
                             print(f"OOM: model={m} compute={ct} batch={b} -> prøver fallback...")
-                            # Reload for å komme tilbake fra evt. korrupt GPU state etter OOM
                             self.load(m, ct, self.cfg.device)
                             continue
                         raise
 
-        # Hvis alt på GPU feilet og CPU fallback er tillatt:
         if self.cfg.allow_cpu_fallback_on_oom and self.cfg.device.startswith("cuda"):
             print("ADVARSEL: Alle GPU-fallbacks feilet. Prøver CPU fallback (kan være tregt).")
             try:
@@ -560,19 +565,17 @@ def process_audio() -> None:
     s3 = get_s3_client(cfg)
 
     resolved_model = resolve_whisper_model_path(cfg)
-    print(f"[entry] DEVICE={cfg.device} ALIGN_DEVICE={cfg.align_device} BATCH={cfg.batch_size} MODEL={resolved_model}")
+    print(f"[entry] DEVICE={cfg.device} ALIGN_DEVICE={cfg.align_device} DIAR_DEVICE={cfg.diarization_device} "
+          f"BATCH={cfg.batch_size} MODEL={resolved_model}")
 
-    # ASR manager (OOM-safe)
     asr = ASRManager(cfg, resolved_model)
 
-    # Alignment én gang (på CPU som default)
     align_model = None
     align_metadata = None
     if cfg.enable_alignment:
         print(f"--- Laster alignment-modell (én gang) på {cfg.align_device} ---")
         align_model, align_metadata = whisperx.load_align_model(language_code=cfg.language, device=cfg.align_device)
 
-    # Diarization én gang (robust)
     diarize_model = init_diarization(cfg)
 
     print(f"Lister filer i s3://{cfg.s3_bucket}/{cfg.s3_input_prefix}...")
@@ -606,7 +609,6 @@ def process_audio() -> None:
 
             # 2) Align (valgfritt)
             if cfg.enable_alignment and align_model is not None and align_metadata is not None:
-                # align kjører på cfg.align_device (default cpu)
                 result = whisperx.align(
                     result["segments"],
                     align_model,
