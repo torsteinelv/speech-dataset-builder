@@ -11,10 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
-# Bruk bash for tryggere heredocs
 SHELL ["/bin/bash", "-lc"]
 
-# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip \
       ffmpeg git curl ca-certificates \
@@ -33,9 +31,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
-# ------------------------------------------------------------
 # cuDNN8 side-by-side (kun .so.8*) uten å avinstallere Torch sin cuDNN9
-# ------------------------------------------------------------
 ARG CUDNN8_WHEEL_VERSION=8.9.7.29
 RUN <<'BASH'
 set -euo pipefail
