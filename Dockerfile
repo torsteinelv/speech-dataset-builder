@@ -80,7 +80,6 @@ PY
 rm -rf /tmp/cudnn8
 BASH
 
-# (Valgfritt) fjern execstack-flag på libctranslate2 dersom kernel er hardnet
 RUN python - <<'PY'
 import sysconfig, glob, os, subprocess
 purelib = sysconfig.get_paths()["purelib"]
