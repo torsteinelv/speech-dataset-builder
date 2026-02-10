@@ -30,10 +30,37 @@ def env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def cuda_cleanup() -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def is_oom_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return (
+        "out of memory" in msg
+        or "cuda failed with error out of memory" in msg
+        or "cuda out of memory" in msg
+        or "cublas" in msg and "alloc" in msg
+    )
+
+
 # -----------------------------
 # HF Hub compat patch:
 # huggingface_hub v1.x bruker "token=" i stedet for "use_auth_token="
-# mens pyannote/whisperx ofte sender fortsatt "use_auth_token="
+# men pyannote/whisperx i noen stacker sender fortsatt "use_auth_token="
 # -----------------------------
 def patch_hf_hub_download_use_auth_token() -> None:
     try:
@@ -64,17 +91,14 @@ def patch_hf_hub_download_use_auth_token() -> None:
             kwargs["token"] = tok
         return orig(*args, **kwargs)
 
-    # Patch top-level + file_download (noen libs importerer via file_download)
     huggingface_hub.hf_hub_download = compat_hf_hub_download
     try:
         hf_file_download.hf_hub_download = compat_hf_hub_download
     except Exception:
         pass
 
-    # Patch pyannote sin modulvariabel (unngår å måtte scanne sys.modules)
     try:
         import pyannote.audio.core.pipeline as pa_pipeline
-
         pa_pipeline.hf_hub_download = compat_hf_hub_download
     except Exception:
         pass
@@ -93,7 +117,6 @@ class Config:
     whisper_model: str
     fallback_model: str
     skip_ct2_conversion: bool
-    ct2_force: bool
 
     # GPU/compute
     device: str
@@ -101,8 +124,14 @@ class Config:
     compute_type: str
     language: str
 
+    # OOM strategy
+    auto_batch_cap: bool
+    allow_model_downsize_on_oom: bool
+    allow_cpu_fallback_on_oom: bool
+
     # WhisperX steg
     enable_alignment: bool
+    align_device: str
     enable_diarization: bool
     strict_diarization: bool
     diarization_model: str
@@ -131,6 +160,42 @@ class Config:
         return f"{self.s3_base_path}/processed/"
 
 
+def gpu_total_mem_gb() -> Optional[float]:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(0)
+        return props.total_memory / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def cap_batch_size(cfg: Config) -> None:
+    if not cfg.auto_batch_cap:
+        return
+    if not cfg.device.startswith("cuda"):
+        return
+    total = gpu_total_mem_gb()
+    if total is None:
+        return
+
+    # konservative caps for large models
+    if total <= 6:
+        cap = 1
+    elif total <= 8:
+        cap = 2
+    elif total <= 12:
+        cap = 4
+    elif total <= 16:
+        cap = 8
+    else:
+        cap = 16
+
+    if cfg.batch_size > cap:
+        print(f"ADVARSEL: GPU {total:.1f}GB -> capper BATCH_SIZE {cfg.batch_size} -> {cap}")
+        cfg.batch_size = cap
+
+
 def load_config() -> Config:
     load_dotenv()
 
@@ -140,7 +205,6 @@ def load_config() -> Config:
         or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     )
 
-    # cache dir
     default_cache = Path(os.getenv("MODEL_CACHE_DIR", "/models_cache"))
     if not default_cache.exists():
         default_cache = Path("models_cache")
@@ -154,12 +218,16 @@ def load_config() -> Config:
         whisper_model=os.getenv("WHISPER_MODEL", "TheStigh/nb-whisper-large-ct2").strip(),
         fallback_model=os.getenv("FALLBACK_MODEL", "large-v3").strip(),
         skip_ct2_conversion=env_bool("SKIP_CT2_CONVERSION", "1"),
-        ct2_force=env_bool("CT2_FORCE", "0"),
         device=os.getenv("DEVICE", "cuda").strip(),
-        batch_size=int(os.getenv("BATCH_SIZE", "32")),
+        batch_size=int(os.getenv("BATCH_SIZE", "8")),
         compute_type=os.getenv("COMPUTE_TYPE", "float16").strip(),
         language=os.getenv("LANGUAGE", "no").strip(),
+        auto_batch_cap=env_bool("AUTO_BATCH_CAP", "1"),
+        allow_model_downsize_on_oom=env_bool("ALLOW_MODEL_DOWNSIZE_ON_OOM", "1"),
+        allow_cpu_fallback_on_oom=env_bool("ALLOW_CPU_FALLBACK_ON_OOM", "0"),
         enable_alignment=env_bool("ENABLE_ALIGNMENT", "1"),
+        # ✅ viktig: alignment på CPU som default (reduserer GPU OOM)
+        align_device=os.getenv("ALIGN_DEVICE", "cpu").strip(),
         enable_diarization=env_bool("ENABLE_DIARIZATION", "1"),
         strict_diarization=env_bool("STRICT_DIARIZATION", "0"),
         diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1").strip(),
@@ -183,6 +251,8 @@ def load_config() -> Config:
 
     cfg.local_temp_dir.mkdir(parents=True, exist_ok=True)
     cfg.model_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cap_batch_size(cfg)
     return cfg
 
 
@@ -221,9 +291,6 @@ def looks_like_ct2_model_id(model_id: str) -> bool:
 
 
 def map_nbailab_to_ct2(model_id: str) -> Optional[str]:
-    """
-    Mapper NbAiLab transformer-modeller til kjente CT2 repoer (kvalitet først).
-    """
     m = model_id.strip()
     mo = re.match(r"(?i)^NbAiLab/nb-whisper-(tiny|base|small|medium|large)$", m)
     if mo:
@@ -235,19 +302,15 @@ def map_nbailab_to_ct2(model_id: str) -> Optional[str]:
 def resolve_whisper_model_path(cfg: Config) -> str:
     m = cfg.whisper_model.strip()
 
-    # Lokal sti?
     if Path(m).exists():
         return m
 
-    # Innebygd faster-whisper sizes: "base", "large-v3", etc
     if "/" not in m:
         return m
 
-    # Allerede CT2 repo-id
     if looks_like_ct2_model_id(m):
         return m
 
-    # SKIP_CT2_CONVERSION=1: map til CT2 hvis mulig
     if cfg.skip_ct2_conversion:
         mapped = map_nbailab_to_ct2(m)
         if mapped:
@@ -260,9 +323,9 @@ def resolve_whisper_model_path(cfg: Config) -> str:
         )
         return cfg.fallback_model
 
-    # Hvis du virkelig vil konvertere i runtime (ikke anbefalt), kan du legge det inn her igjen.
+    # hvis du virkelig vil runtime-konvertering kan vi legge det inn igjen, men du ville ha stabilt oppsett.
     print(
-        "ADVARSEL: SKIP_CT2_CONVERSION=0 men runtime-konvertering er slått av i denne 'robuste' profilen. "
+        "ADVARSEL: SKIP_CT2_CONVERSION=0 men runtime-konvertering er deaktivert i denne stabile profilen. "
         f"Fallback til '{cfg.fallback_model}'."
     )
     return cfg.fallback_model
@@ -299,9 +362,7 @@ def filter_data(
             curr_end = float(df.loc[i, "end"])
             next_start = float(df.loc[i + 1, "start"])
             if curr_end > next_start:
-                zone_start = next_start - cfg.buffer_zone
-                zone_end = curr_end + cfg.buffer_zone
-                bad_zones.append((zone_start, zone_end))
+                bad_zones.append((next_start - cfg.buffer_zone, curr_end + cfg.buffer_zone))
 
     clean: List[Dict[str, Any]] = []
     for seg in result.get("segments", []):
@@ -335,10 +396,6 @@ def filter_data(
 
 
 def init_diarization(cfg: Config):
-    """
-    Laster diarization pipeline én gang.
-    Robust: hvis gated/mangler token/ikke akseptert -> disable diarization (med mindre STRICT_DIARIZATION=1)
-    """
     if not cfg.enable_diarization:
         return None
 
@@ -350,7 +407,7 @@ def init_diarization(cfg: Config):
         return None
 
     if DiarizationPipeline is None or assign_word_speakers is None:
-        msg = "WhisperX diarization API (whisperx.diarize) er ikke tilgjengelig i denne installasjonen."
+        msg = "WhisperX diarization API (whisperx.diarize) ikke tilgjengelig."
         if cfg.strict_diarization:
             raise RuntimeError(msg)
         print("ADVARSEL:", msg)
@@ -365,23 +422,18 @@ def init_diarization(cfg: Config):
             use_auth_token=cfg.hf_token,
             device=cfg.device,
         )
-        # Ekstra sanity: noen ganger kan intern model ende opp None hvis nedlasting feiler
         if getattr(diarize_model, "model", None) is None:
             raise RuntimeError(
-                "DiarizationPipeline lastet, men underliggende model er None. "
-                "Dette skjer typisk hvis modellen er gated og vilkår ikke er akseptert."
+                "DiarizationPipeline lastet, men underliggende model er None (typisk gated/ikke akseptert)."
             )
         return diarize_model
-
     except Exception as e:
         print("\nADVARSEL: Kunne ikke laste diarization pipeline.")
         print("Årsak:", repr(e))
         print(
-            "\nFor å aktivere diarization må du:\n"
-            "  1) logge inn på Hugging Face med kontoen som HF_TOKEN tilhører\n"
-            "  2) åpne modellen og akseptere vilkår:\n"
-            "     - https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-            "  3) sørge for at token har 'read' og at det er samme bruker som aksepterte vilkårene.\n"
+            "\nFor å aktivere diarization må du akseptere vilkår på HF-kontoen som tokenet tilhører:\n"
+            "  - https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "Deretter vil diarization fungere automatisk.\n"
         )
         if cfg.strict_diarization:
             raise
@@ -389,24 +441,136 @@ def init_diarization(cfg: Config):
         return None
 
 
+def compute_type_candidates(primary: str) -> List[str]:
+    out = []
+    def add(x: str):
+        if x and x not in out:
+            out.append(x)
+
+    add(primary)
+
+    # gode OOM-fallbacks for CT2/faster-whisper
+    add("int8_float16")
+    add("int8")
+
+    return out
+
+
+def batch_candidates(primary: int) -> List[int]:
+    out = []
+    b = max(1, int(primary))
+    while True:
+        if b not in out:
+            out.append(b)
+        if b == 1:
+            break
+        b = max(1, b // 2)
+    return out
+
+
+def model_downsize_chain(model_id: str) -> List[str]:
+    """
+    Hvis du bruker TheStigh/nb-whisper-<size>-ct2 kan vi auto-downgrade ved OOM:
+      large -> medium -> small -> base -> tiny
+    """
+    sizes = ["large", "medium", "small", "base", "tiny"]
+    m = re.match(r"^(TheStigh/nb-whisper-)(tiny|base|small|medium|large)(-ct2)$", model_id)
+    if not m:
+        return [model_id]
+
+    prefix, cur, suffix = m.group(1), m.group(2), m.group(3)
+    idx = sizes.index(cur)
+    chain = [model_id]
+    for s in sizes[idx + 1 :]:
+        chain.append(f"{prefix}{s}{suffix}")
+    return chain
+
+
+class ASRManager:
+    def __init__(self, cfg: Config, model_id: str):
+        self.cfg = cfg
+        self.device = cfg.device
+        self.language = cfg.language
+        self.model_id = model_id
+        self.compute_type = cfg.compute_type
+        self.model = None
+        self.load(self.model_id, self.compute_type, self.device)
+
+    def unload(self):
+        try:
+            if self.model is not None:
+                del self.model
+        except Exception:
+            pass
+        self.model = None
+        cuda_cleanup()
+
+    def load(self, model_id: str, compute_type: str, device: str):
+        self.unload()
+        self.model_id = model_id
+        self.compute_type = compute_type
+        self.device = device
+        print(f"--- Laster ASR: model={model_id} device={device} compute_type={compute_type} ---")
+        self.model = whisperx.load_model(model_id, device, compute_type=compute_type, language=self.language)
+
+    def transcribe_oom_safe(self, audio):
+        model_chain = model_downsize_chain(self.model_id) if self.cfg.allow_model_downsize_on_oom else [self.model_id]
+        ct_chain = compute_type_candidates(self.compute_type)
+        b_chain = batch_candidates(self.cfg.batch_size)
+
+        last_err: Optional[Exception] = None
+
+        for midx, m in enumerate(model_chain):
+            for cidx, ct in enumerate(ct_chain):
+                # last inn (eller reload) modellen for denne kombinasjonen
+                if self.model is None or self.model_id != m or self.compute_type != ct or self.device != self.cfg.device:
+                    self.load(m, ct, self.cfg.device)
+
+                for b in b_chain:
+                    try:
+                        res = self.model.transcribe(audio, batch_size=b, language=self.language)
+                        # "lås inn" suksess-parametre for resten av runnet
+                        if b != self.cfg.batch_size:
+                            print(f"INFO: batch_size justert for stabilitet: {self.cfg.batch_size} -> {b}")
+                            self.cfg.batch_size = b
+                        return res
+                    except Exception as e:
+                        last_err = e
+                        if is_oom_error(e):
+                            print(f"OOM: model={m} compute={ct} batch={b} -> prøver fallback...")
+                            # Reload for å komme tilbake fra evt. korrupt GPU state etter OOM
+                            self.load(m, ct, self.cfg.device)
+                            continue
+                        raise
+
+        # Hvis alt på GPU feilet og CPU fallback er tillatt:
+        if self.cfg.allow_cpu_fallback_on_oom and self.cfg.device.startswith("cuda"):
+            print("ADVARSEL: Alle GPU-fallbacks feilet. Prøver CPU fallback (kan være tregt).")
+            try:
+                self.load(model_chain[-1], "int8", "cpu")
+                return self.model.transcribe(audio, batch_size=1, language=self.language)
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(f"Kunne ikke transkribere pga OOM etter alle fallbacks. Siste error: {last_err!r}")
+
+
 def process_audio() -> None:
     cfg = load_config()
     s3 = get_s3_client(cfg)
 
-    model_path = resolve_whisper_model_path(cfg)
+    resolved_model = resolve_whisper_model_path(cfg)
+    print(f"[entry] DEVICE={cfg.device} ALIGN_DEVICE={cfg.align_device} BATCH={cfg.batch_size} MODEL={resolved_model}")
 
-    print(f"[entry] DEVICE={cfg.device}  COMPUTE_TYPE={cfg.compute_type}  MODEL={model_path}")
-    print(f"--- Initialiserer WhisperX ({cfg.device}) ---")
-    print(f"--- Prosjekt: {cfg.s3_base_path} ---")
+    # ASR manager (OOM-safe)
+    asr = ASRManager(cfg, resolved_model)
 
-    model = whisperx.load_model(model_path, cfg.device, compute_type=cfg.compute_type, language=cfg.language)
-
-    # Alignment én gang
+    # Alignment én gang (på CPU som default)
     align_model = None
     align_metadata = None
     if cfg.enable_alignment:
-        print("--- Laster alignment-modell (én gang) ---")
-        align_model, align_metadata = whisperx.load_align_model(language_code=cfg.language, device=cfg.device)
+        print(f"--- Laster alignment-modell (én gang) på {cfg.align_device} ---")
+        align_model, align_metadata = whisperx.load_align_model(language_code=cfg.language, device=cfg.align_device)
 
     # Diarization én gang (robust)
     diarize_model = init_diarization(cfg)
@@ -435,24 +599,24 @@ def process_audio() -> None:
 
         try:
             s3.download_file(cfg.s3_bucket, s3_key, str(local_mp3))
-
             audio = whisperx.load_audio(str(local_mp3))
 
-            # 1) Transcribe
-            result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language)
+            # 1) Transcribe (OOM-safe)
+            result = asr.transcribe_oom_safe(audio)
 
-            # 2) Align
+            # 2) Align (valgfritt)
             if cfg.enable_alignment and align_model is not None and align_metadata is not None:
+                # align kjører på cfg.align_device (default cpu)
                 result = whisperx.align(
                     result["segments"],
                     align_model,
                     align_metadata,
                     audio,
-                    cfg.device,
+                    cfg.align_device,
                     return_char_alignments=False,
                 )
 
-            # 3) Diarize + assign speakers
+            # 3) Diarize + assign speakers (valgfritt)
             diarize_df: Optional[pd.DataFrame] = None
             if diarize_model is not None:
                 try:
@@ -473,7 +637,6 @@ def process_audio() -> None:
 
             # 4) Filter + skriv JSONL
             clean = filter_data(cfg, result, diarize_df, relative)
-
             with open(local_jsonl, "w", encoding="utf-8") as f:
                 for row in clean:
                     json.dump(row, f, ensure_ascii=False)
@@ -496,10 +659,7 @@ def process_audio() -> None:
                     local_jsonl.unlink()
             except Exception:
                 pass
-
-            if cfg.device.startswith("cuda"):
-                gc.collect()
-                torch.cuda.empty_cache()
+            cuda_cleanup()
 
 
 if __name__ == "__main__":
