@@ -6,7 +6,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,7 +15,6 @@ import pandas as pd
 import torch
 import whisperx
 from dotenv import load_dotenv
-
 
 # -----------------------------
 # WhisperX diarization API (nyere WhisperX)
@@ -28,31 +26,33 @@ except Exception:
     assign_word_speakers = None
 
 
+def env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 # -----------------------------
 # HF Hub compat patch:
 # huggingface_hub v1.x bruker "token=" i stedet for "use_auth_token="
-# men pyannote/whisperx i din stack sender fortsatt "use_auth_token="
-# -> TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'
+# mens pyannote/whisperx ofte sender fortsatt "use_auth_token="
 # -----------------------------
 def patch_hf_hub_download_use_auth_token() -> None:
     try:
         import huggingface_hub
+        from huggingface_hub import file_download as hf_file_download
     except Exception:
         return
 
-    # Hvis installert huggingface_hub fortsatt støtter use_auth_token -> ingen patch nødvendig
+    # Hvis hf_hub_download fortsatt støtter use_auth_token -> ingen patch
     try:
         sig = inspect.signature(huggingface_hub.hf_hub_download)
         if "use_auth_token" in sig.parameters:
             return
     except Exception:
-        # Hvis signature inspection feiler, patcher vi uansett
         pass
 
     orig = huggingface_hub.hf_hub_download
 
     def compat_hf_hub_download(*args, **kwargs):
-        # Oversett use_auth_token -> token
         if "use_auth_token" in kwargs and "token" not in kwargs:
             tok = kwargs.pop("use_auth_token")
             if tok is True:
@@ -64,20 +64,20 @@ def patch_hf_hub_download_use_auth_token() -> None:
             kwargs["token"] = tok
         return orig(*args, **kwargs)
 
-    # Patch top-level
+    # Patch top-level + file_download (noen libs importerer via file_download)
     huggingface_hub.hf_hub_download = compat_hf_hub_download
+    try:
+        hf_file_download.hf_hub_download = compat_hf_hub_download
+    except Exception:
+        pass
 
-    # Patch alle allerede-importerte moduler som holder en direkte referanse til originalfunksjonen
-    for m in list(sys.modules.values()):
-        try:
-            if getattr(m, "hf_hub_download", None) is orig:
-                setattr(m, "hf_hub_download", compat_hf_hub_download)
-        except Exception:
-            pass
+    # Patch pyannote sin modulvariabel (unngår å måtte scanne sys.modules)
+    try:
+        import pyannote.audio.core.pipeline as pa_pipeline
 
-
-def env_bool(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+        pa_pipeline.hf_hub_download = compat_hf_hub_download
+    except Exception:
+        pass
 
 
 @dataclass
@@ -95,7 +95,7 @@ class Config:
     skip_ct2_conversion: bool
     ct2_force: bool
 
-    # GPU / compute
+    # GPU/compute
     device: str
     batch_size: int
     compute_type: str
@@ -104,10 +104,11 @@ class Config:
     # WhisperX steg
     enable_alignment: bool
     enable_diarization: bool
+    strict_diarization: bool
     diarization_model: str
     hf_token: Optional[str]
 
-    # Diarization speaker hints (0 = auto/unused)
+    # speaker hints
     num_speakers: int
     min_speakers: int
     max_speakers: int
@@ -150,9 +151,9 @@ def load_config() -> Config:
         aws_access_key=os.getenv("AWS_ACCESS_KEY_ID"),
         aws_secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         s3_base_path=os.getenv("S3_BASE_PATH", "002_speech_dataset").strip(),
-        whisper_model=os.getenv("WHISPER_MODEL", "NbAiLab/nb-whisper-large").strip(),
+        whisper_model=os.getenv("WHISPER_MODEL", "TheStigh/nb-whisper-large-ct2").strip(),
         fallback_model=os.getenv("FALLBACK_MODEL", "large-v3").strip(),
-        skip_ct2_conversion=env_bool("SKIP_CT2_CONVERSION", "0"),
+        skip_ct2_conversion=env_bool("SKIP_CT2_CONVERSION", "1"),
         ct2_force=env_bool("CT2_FORCE", "0"),
         device=os.getenv("DEVICE", "cuda").strip(),
         batch_size=int(os.getenv("BATCH_SIZE", "32")),
@@ -160,6 +161,7 @@ def load_config() -> Config:
         language=os.getenv("LANGUAGE", "no").strip(),
         enable_alignment=env_bool("ENABLE_ALIGNMENT", "1"),
         enable_diarization=env_bool("ENABLE_DIARIZATION", "1"),
+        strict_diarization=env_bool("STRICT_DIARIZATION", "0"),
         diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1").strip(),
         hf_token=hf_token,
         num_speakers=int(os.getenv("NUM_SPEAKERS", "0")),
@@ -173,16 +175,14 @@ def load_config() -> Config:
     )
 
     if not cfg.s3_bucket:
-        raise ValueError("Mangler S3_BUCKET i env / secret!")
+        raise ValueError("Mangler S3_BUCKET i env/secret!")
 
-    # fallback hvis cuda ikke er tilgjengelig
     if cfg.device.startswith("cuda") and not torch.cuda.is_available():
         print("ADVARSEL: DEVICE=cuda men torch.cuda.is_available()=False. Bruker cpu.")
         cfg.device = "cpu"
 
     cfg.local_temp_dir.mkdir(parents=True, exist_ok=True)
     cfg.model_cache_dir.mkdir(parents=True, exist_ok=True)
-
     return cfg
 
 
@@ -190,12 +190,9 @@ def get_s3_client(cfg: Config):
     kwargs: Dict[str, Any] = {}
     if cfg.s3_endpoint:
         kwargs["endpoint_url"] = cfg.s3_endpoint
-
-    # Hvis cluster bruker IAM role, kan keys være tomme – boto3 håndterer det.
     if cfg.aws_access_key and cfg.aws_secret_key:
         kwargs["aws_access_key_id"] = cfg.aws_access_key
         kwargs["aws_secret_access_key"] = cfg.aws_secret_key
-
     return boto3.client("s3", **kwargs)
 
 
@@ -207,17 +204,14 @@ def list_mp3_keys(cfg: Config, s3) -> List[str]:
         if token:
             params["ContinuationToken"] = token
         resp = s3.list_objects_v2(**params)
-
         for obj in resp.get("Contents", []):
             k = obj.get("Key", "")
             if k.lower().endswith(".mp3"):
                 keys.append(k)
-
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
         else:
             break
-
     return keys
 
 
@@ -228,101 +222,32 @@ def looks_like_ct2_model_id(model_id: str) -> bool:
 
 def map_nbailab_to_ct2(model_id: str) -> Optional[str]:
     """
-    Hvis brukeren peker på NbAiLab transformers-modell, map til en kjent CT2 repo.
-    Dette lar oss ha SKIP_CT2_CONVERSION=1 og fortsatt kjøre på GPU uten converter.
+    Mapper NbAiLab transformer-modeller til kjente CT2 repoer (kvalitet først).
     """
     m = model_id.strip()
-
-    # Distil turbo beta -> CT2 (Hexoplon)
-    if m.lower() in {
-        "nbailab/nb-whisper-large-distil-turbo-beta",
-        "nbailab/nb-whisper-large-distil-turbo-beta ".strip().lower(),
-    }:
-        return "Hexoplon/nb-whisper-large-distil-turbo-beta-ct2"
-
-    # Standard størrelser -> TheStigh CT2 repos
     mo = re.match(r"(?i)^NbAiLab/nb-whisper-(tiny|base|small|medium|large)$", m)
     if mo:
         size = mo.group(1).lower()
         return f"TheStigh/nb-whisper-{size}-ct2"
-
     return None
 
 
-def ct2_is_valid_dir(p: Path) -> bool:
-    # CT2 output pleier å inneholde config.json + model.bin
-    return (p / "config.json").exists() and (p / "model.bin").exists()
-
-
-def convert_transformers_to_ct2(cfg: Config, model_id: str) -> str:
-    safe = model_id.replace("/", "_")
-    out_dir = cfg.model_cache_dir / f"{safe}_ct2"
-    lock_path = cfg.model_cache_dir / f"{safe}_ct2.lock"
-
-    # enkel fil-lock (samme PV) for å unngå raseforhold
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lockf:
-        try:
-            import fcntl
-
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-        except Exception:
-            pass
-
-        # Recheck når vi har lock
-        if out_dir.exists() and ct2_is_valid_dir(out_dir):
-            print(f"--- Fant bufret CT2-modell: {out_dir} ---")
-            return str(out_dir)
-
-        # Bygg kommando. Viktig: ikke skap out_dir før converter (ellers feiler uten --force)
-        force = cfg.ct2_force or out_dir.exists()
-        cmd = [
-            "ct2-transformers-converter",
-            "--model",
-            model_id,
-            "--output_dir",
-            str(out_dir),
-            "--quantization",
-            cfg.compute_type,
-            "--low_cpu_mem_usage",
-        ]
-        if force:
-            cmd.append("--force")
-
-        print(f"--- Konverterer {model_id} til CT2... (force={force}) ---")
-        subprocess.run(cmd, check=True)
-
-        if not ct2_is_valid_dir(out_dir):
-            raise RuntimeError(f"CT2-konvertering ferdig, men {out_dir} ser ikke komplett ut.")
-
-        return str(out_dir)
-
-
 def resolve_whisper_model_path(cfg: Config) -> str:
-    """
-    Returnerer det som skal sendes inn i whisperx.load_model().
-    - Hvis SKIP_CT2_CONVERSION=1:
-        - bruk CT2 repo direkte
-        - eller map NbAiLab/... -> kjent CT2 repo
-        - ellers fallback til cfg.fallback_model
-    - Hvis SKIP_CT2_CONVERSION=0:
-        - konverter NbAiLab/... til CT2 i cache (robust + lock + --force ved behov)
-    """
     m = cfg.whisper_model.strip()
 
     # Lokal sti?
     if Path(m).exists():
         return m
 
-    # Innebygd faster-whisper sizes: "base", "large-v3", etc (ingen "/")
+    # Innebygd faster-whisper sizes: "base", "large-v3", etc
     if "/" not in m:
         return m
 
-    # Hvis den allerede er CT2 repo-id
+    # Allerede CT2 repo-id
     if looks_like_ct2_model_id(m):
         return m
 
-    # Hvis vi har SKIP_CT2_CONVERSION=1, prøv å mappe til CT2
+    # SKIP_CT2_CONVERSION=1: map til CT2 hvis mulig
     if cfg.skip_ct2_conversion:
         mapped = map_nbailab_to_ct2(m)
         if mapped:
@@ -330,17 +255,17 @@ def resolve_whisper_model_path(cfg: Config) -> str:
             return mapped
 
         print(
-            f"ADVARSEL: SKIP_CT2_CONVERSION=1 men WHISPER_MODEL={m} ser ikke ut som CT2. "
-            f"Faller tilbake til '{cfg.fallback_model}'."
+            f"ADVARSEL: SKIP_CT2_CONVERSION=1 men WHISPER_MODEL={m} er ikke CT2 og har ingen mapping. "
+            f"Fallback til '{cfg.fallback_model}'."
         )
         return cfg.fallback_model
 
-    # Ellers: konverter transformers-modell til CT2 i cache
-    try:
-        return convert_transformers_to_ct2(cfg, m)
-    except Exception as e:
-        print(f"Konvertering feilet ({e}). Fallback til '{cfg.fallback_model}'.")
-        return cfg.fallback_model
+    # Hvis du virkelig vil konvertere i runtime (ikke anbefalt), kan du legge det inn her igjen.
+    print(
+        "ADVARSEL: SKIP_CT2_CONVERSION=0 men runtime-konvertering er slått av i denne 'robuste' profilen. "
+        f"Fallback til '{cfg.fallback_model}'."
+    )
+    return cfg.fallback_model
 
 
 def s3_result_key(cfg: Config, s3_input_key: str) -> Tuple[str, str]:
@@ -367,7 +292,6 @@ def filter_data(
     diarize_df: Optional[pd.DataFrame],
     source_name: str,
 ) -> List[Dict[str, Any]]:
-    # Bygg “bad overlap zones” fra diarization (hvis tilgjengelig)
     bad_zones: List[Tuple[float, float]] = []
     if diarize_df is not None and isinstance(diarize_df, pd.DataFrame) and not diarize_df.empty:
         df = diarize_df.sort_values("start").reset_index(drop=True)
@@ -375,13 +299,11 @@ def filter_data(
             curr_end = float(df.loc[i, "end"])
             next_start = float(df.loc[i + 1, "start"])
             if curr_end > next_start:
-                # overlapp
                 zone_start = next_start - cfg.buffer_zone
                 zone_end = curr_end + cfg.buffer_zone
                 bad_zones.append((zone_start, zone_end))
 
     clean: List[Dict[str, Any]] = []
-
     for seg in result.get("segments", []):
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", 0.0))
@@ -392,8 +314,6 @@ def filter_data(
             continue
         if (end - start) < cfg.min_duration:
             continue
-
-        # dropp hvis i overlap zone
         if any((start < z_end and end > z_start) for z_start, z_end in bad_zones):
             continue
 
@@ -411,8 +331,62 @@ def filter_data(
                 "score": None if avg_score is None else round(avg_score, 3),
             }
         )
-
     return clean
+
+
+def init_diarization(cfg: Config):
+    """
+    Laster diarization pipeline én gang.
+    Robust: hvis gated/mangler token/ikke akseptert -> disable diarization (med mindre STRICT_DIARIZATION=1)
+    """
+    if not cfg.enable_diarization:
+        return None
+
+    if not cfg.hf_token:
+        msg = "ENABLE_DIARIZATION=1 men HF_TOKEN mangler. Skipper diarization."
+        if cfg.strict_diarization:
+            raise RuntimeError(msg)
+        print("ADVARSEL:", msg)
+        return None
+
+    if DiarizationPipeline is None or assign_word_speakers is None:
+        msg = "WhisperX diarization API (whisperx.diarize) er ikke tilgjengelig i denne installasjonen."
+        if cfg.strict_diarization:
+            raise RuntimeError(msg)
+        print("ADVARSEL:", msg)
+        return None
+
+    patch_hf_hub_download_use_auth_token()
+
+    print(f"--- Laster diarization-modell: {cfg.diarization_model} (én gang) ---")
+    try:
+        diarize_model = DiarizationPipeline(
+            model_name=cfg.diarization_model,
+            use_auth_token=cfg.hf_token,
+            device=cfg.device,
+        )
+        # Ekstra sanity: noen ganger kan intern model ende opp None hvis nedlasting feiler
+        if getattr(diarize_model, "model", None) is None:
+            raise RuntimeError(
+                "DiarizationPipeline lastet, men underliggende model er None. "
+                "Dette skjer typisk hvis modellen er gated og vilkår ikke er akseptert."
+            )
+        return diarize_model
+
+    except Exception as e:
+        print("\nADVARSEL: Kunne ikke laste diarization pipeline.")
+        print("Årsak:", repr(e))
+        print(
+            "\nFor å aktivere diarization må du:\n"
+            "  1) logge inn på Hugging Face med kontoen som HF_TOKEN tilhører\n"
+            "  2) åpne modellen og akseptere vilkår:\n"
+            "     - https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "  3) sørge for at token har 'read' og at det er samme bruker som aksepterte vilkårene.\n"
+        )
+        if cfg.strict_diarization:
+            raise
+        print("Fortsetter uten diarization (speaker='Unknown').\n")
+        return None
 
 
 def process_audio() -> None:
@@ -421,34 +395,21 @@ def process_audio() -> None:
 
     model_path = resolve_whisper_model_path(cfg)
 
+    print(f"[entry] DEVICE={cfg.device}  COMPUTE_TYPE={cfg.compute_type}  MODEL={model_path}")
     print(f"--- Initialiserer WhisperX ({cfg.device}) ---")
     print(f"--- Prosjekt: {cfg.s3_base_path} ---")
+
     model = whisperx.load_model(model_path, cfg.device, compute_type=cfg.compute_type, language=cfg.language)
 
-    # Alignment lastes én gang
+    # Alignment én gang
     align_model = None
     align_metadata = None
     if cfg.enable_alignment:
         print("--- Laster alignment-modell (én gang) ---")
         align_model, align_metadata = whisperx.load_align_model(language_code=cfg.language, device=cfg.device)
 
-    # Diarization lastes én gang
-    diarize_model = None
-    if cfg.enable_diarization:
-        if not cfg.hf_token:
-            print("ADVARSEL: ENABLE_DIARIZATION=1 men HF_TOKEN mangler. Skipper diarization.")
-        elif DiarizationPipeline is None or assign_word_speakers is None:
-            print("ADVARSEL: whisperx.diarize ikke tilgjengelig. Skipper diarization.")
-        else:
-            # Patch HF Hub kompat før vi bygger pipeline
-            patch_hf_hub_download_use_auth_token()
-
-            print(f"--- Laster diarization-modell: {cfg.diarization_model} (én gang) ---")
-            diarize_model = DiarizationPipeline(
-                model_name=cfg.diarization_model,
-                use_auth_token=cfg.hf_token,
-                device=cfg.device,
-            )
+    # Diarization én gang (robust)
+    diarize_model = init_diarization(cfg)
 
     print(f"Lister filer i s3://{cfg.s3_bucket}/{cfg.s3_input_prefix}...")
     files = list_mp3_keys(cfg, s3)
@@ -457,7 +418,7 @@ def process_audio() -> None:
     for idx, s3_key in enumerate(files, start=1):
         relative, out_key = s3_result_key(cfg, s3_key)
 
-        # Skip ferdige (idempotent)
+        # idempotent skip
         try:
             s3.head_object(Bucket=cfg.s3_bucket, Key=out_key)
             print(f"Skipper {relative} (Ferdig).")
@@ -480,7 +441,7 @@ def process_audio() -> None:
             # 1) Transcribe
             result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language)
 
-            # 2) Align (valgfritt)
+            # 2) Align
             if cfg.enable_alignment and align_model is not None and align_metadata is not None:
                 result = whisperx.align(
                     result["segments"],
@@ -491,7 +452,7 @@ def process_audio() -> None:
                     return_char_alignments=False,
                 )
 
-            # 3) Diarize + assign speakers (valgfritt)
+            # 3) Diarize + assign speakers
             diarize_df: Optional[pd.DataFrame] = None
             if diarize_model is not None:
                 try:
@@ -525,7 +486,6 @@ def process_audio() -> None:
             print(f"FEIL på {relative}: {e}")
 
         finally:
-            # cleanup
             try:
                 if local_mp3.exists():
                     local_mp3.unlink()
