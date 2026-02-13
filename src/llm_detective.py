@@ -75,22 +75,27 @@ def main():
             for line in content.splitlines():
                 if not line.strip(): continue
                 data = json.loads(line)
-                if data['start'] > 180: break
+                if data['start'] > 600: break
                 manus += f"{data['speaker']}: {data['text']}\n"
 
             if not manus: continue
 
-            prompt = f"""Du er en super-detektiv. Her er de første 3 minuttene av podcast-episoden '{ep_name}'.
-Verten for podcasten er Torstein.
+            prompt = f"""Du er en super-detektiv som analyserer podcast-manuskripter. 
+Her er de første 3 minuttene av episoden: '{ep_name}'.
+
+Oppgave:
+Identifiser alle personene som snakker (SPEAKER_00, SPEAKER_01, osv.). 
+Bruk informasjonen i tittelen og manuset (hvem som introduserer hvem, hvem som blir stilt spørsmål, hvem som styrer ordet) for å finne deres fulle navn.
+
+Regler:
+1. Svar KUN med et gyldig JSON-objekt.
+2. Nøkkelen skal være SPEAKER-koden (f.eks. "SPEAKER_01").
+3. Verdien skal være personens fulle navn (f.eks. "Torstein Thorsland" eller "Erna Solberg").
+4. Hvis du er usikker på et navn, gjett basert på det mest sannsynlige ut fra kontekst.
 
 Manuskript:
 {manus}
-
-Din oppgave: Hvem er de forskjellige personene (SPEAKER_00, SPEAKER_01 osv.)? 
-Svar KUN med et gyldig JSON-objekt der nøklene er SPEAKER-koden, og verdien er personens fulle navn. Ikke skriv noe annen tekst.
-
-Eksempel på ønsket svar:
-{{"SPEAKER_00": "Torstein", "SPEAKER_01": "Erna Solberg"}}"""
+"""
 
             headers = {
                 "Authorization": f"Bearer {API_KEY}",
