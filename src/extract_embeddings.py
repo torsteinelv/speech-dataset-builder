@@ -21,7 +21,8 @@ def main():
     )
 
     print("🤖 Laster inn pyannote/embedding modell...")
-    model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("HF_TOKEN"))
+    # HER ER FIKSEN: Hugging Face krever nå "token" i stedet for "use_auth_token"
+    model = Model.from_pretrained("pyannote/embedding", token=os.getenv("HF_TOKEN"))
     inference = Inference(model, window="whole")
 
     # --- GJENOPPTA FREMDRIFT FRA S3 ---
