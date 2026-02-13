@@ -6,7 +6,6 @@ import botocore
 
 # ==========================================
 # MAGISK FIKS (MONKEY PATCH)
-# Fikser pyannote-krasjen UTEN å endre noen versjoner.
 # ==========================================
 import huggingface_hub
 _original_hf_download = huggingface_hub.hf_hub_download
@@ -19,6 +18,7 @@ def _patched_hf_download(*args, **kwargs):
 huggingface_hub.hf_hub_download = _patched_hf_download
 # ==========================================
 
+import torch  # <-- NY: Importerer PyTorch
 from pyannote.audio import Model, Inference
 from pydub import AudioSegment
 
@@ -38,8 +38,12 @@ def main():
 
     print("🤖 Laster inn pyannote/embedding modell...")
     
-    # Koden under bruker det pyannote forventer, mens patchen vår i toppen rydder opp for Hugging Face!
     model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("HF_TOKEN"))
+    
+    # <-- NY: TVINGER MODELLEN OVER PÅ GPU (CUDA) -->
+    print("🚀 Flytter modellen til GPU (CUDA)...")
+    model.to(torch.device("cuda"))
+    
     inference = Inference(model, window="whole")
 
     # --- GJENOPPTA FREMDRIFT FRA S3 ---
