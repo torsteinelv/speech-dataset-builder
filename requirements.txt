@@ -14,3 +14,6 @@ soundfile==0.13.1
 
 torch==2.5.1
 torchaudio==2.5.1
+
+scikit-learn==1.6.1
+pydub==0.25.1
