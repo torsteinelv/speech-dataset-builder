@@ -2,15 +2,17 @@ import os
 import json
 import boto3
 import pickle
-from pathlib import Path
-from dotenv import load_dotenv
+import botocore
 from pyannote.audio import Model, Inference
 from pydub import AudioSegment
 
 def main():
-    load_dotenv()
+    # Hent miljøvariabler
     BUCKET = os.getenv("S3_BUCKET", "ml-data")
+    BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
+    EMBEDDINGS_KEY = f"{BASE_PATH}/metadata/embeddings.pkl"
     
+    print("🔌 Kobler til S3...")
     s3 = boto3.client(
         "s3",
         endpoint_url=os.getenv("S3_ENDPOINT_URL"),
@@ -18,26 +20,28 @@ def main():
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     )
 
-    print("🤖 Loading pyannote/embedding model...")
+    print("🤖 Laster inn pyannote/embedding modell...")
     model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("HF_TOKEN"))
     inference = Inference(model, window="whole")
 
-    # --- GJENOPPTA FREMDRIFT (RESUME) ---
+    # --- GJENOPPTA FREMDRIFT FRA S3 ---
     all_embeddings = {}
-    pickle_file = "embeddings.pkl"
     
-    if os.path.exists(pickle_file):
-        print(f"📥 Found existing '{pickle_file}'. Loading previous progress...")
-        with open(pickle_file, "rb") as f:
-            all_embeddings = pickle.load(f)
-        print(f"   -> Loaded {len(all_embeddings)} fingerprints.")
-    else:
-        print("🆕 Starting fresh. No previous fingerprints found.")
+    try:
+        print(f"📥 Sjekker om {EMBEDDINGS_KEY} finnes i S3...")
+        response = s3.get_object(Bucket=BUCKET, Key=EMBEDDINGS_KEY)
+        all_embeddings = pickle.loads(response['Body'].read())
+        print(f"   -> Fant eksisterende fil! Lastet inn {len(all_embeddings)} fingeravtrykk.")
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "NoSuchKey":
+            print("🆕 Fant ingen tidligere data. Starter med blanke ark.")
+        else:
+            raise e
 
+    print("🔍 Leter etter prosesserte episoder...")
     paginator = s3.get_paginator('list_objects_v2')
-    pages = paginator.paginate(Bucket=BUCKET, Prefix="002_speech_dataset/processed/")
+    pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{BASE_PATH}/processed/")
 
-    print("🔍 Scanning episodes...")
     for page in pages:
         if 'Contents' not in page: continue
         for obj in page['Contents']:
@@ -47,16 +51,15 @@ def main():
             audio_key = jsonl_key.replace("processed/", "raw/").replace(".jsonl", ".mp3")
             ep_name = jsonl_key.split("/")[-1].replace(".jsonl", "")
 
-            # Sjekk om vi allerede har behandlet denne episoden
-            # (Hvis noen av nøklene i ordboken starter med episodens navn)
+            # Sjekk om episoden allerede er prosessert i minnet
             already_processed = any(key.startswith(f"{ep_name}_") for key in all_embeddings.keys())
             if already_processed:
-                print(f"⏩ Skipping: {ep_name} (Already processed)")
+                print(f"⏩ Hopper over: {ep_name} (Allerede prosessert)")
                 continue
 
-            print(f"\n🎧 Processing: {ep_name}")
+            print(f"\n🎧 Behandler: {ep_name}")
             
-            # 1. Read JSONL and find the longest clip per speaker
+            # 1. Les JSONL og finn det lengste klippet per speaker
             response = s3.get_object(Bucket=BUCKET, Key=jsonl_key)
             content = response['Body'].read().decode('utf-8')
             
@@ -72,17 +75,17 @@ def main():
 
             if not speaker_clips: continue
 
-            # 2. Download audio temporarily
+            # 2. Last ned lydfil midlertidig
             temp_audio = "temp_audio.mp3"
             try:
                 s3.download_file(BUCKET, audio_key, temp_audio)
             except Exception as e:
-                print(f"⚠️ Could not find audio for {audio_key}. Skipping.")
+                print(f"⚠️ Fant ikke lydfil for {audio_key}. Hopper over.")
                 continue
 
             audio = AudioSegment.from_file(temp_audio)
 
-            # 3. Create embeddings
+            # 3. Lag fingeravtrykk
             for spk, times in speaker_clips.items():
                 start_ms = int(times['start'] * 1000)
                 end_ms = int(times['end'] * 1000)
@@ -94,17 +97,20 @@ def main():
                 unique_id = f"{ep_name}_{spk}"
                 embedding = inference(temp_clip)
                 all_embeddings[unique_id] = embedding
-                print(f"  👉 Extracted {spk} ({times['duration']:.1f} sec)")
+                print(f"  👉 Hentet ut avtrykk for {spk} ({times['duration']:.1f} sek)")
 
-            # Cleanup files
-            os.remove(temp_audio)
+            # Rydd opp midlertidige filer lokalt
+            if os.path.exists(temp_audio): os.remove(temp_audio)
             if os.path.exists("temp_clip.wav"): os.remove("temp_clip.wav")
 
-            # --- LAGRE ETTER HVER EPISODE ---
-            with open(pickle_file, "wb") as f:
-                pickle.dump(all_embeddings, f)
+            # --- LAGRE PROGRESS TIL S3 ---
+            s3.put_object(
+                Bucket=BUCKET, 
+                Key=EMBEDDINGS_KEY, 
+                Body=pickle.dumps(all_embeddings)
+            )
 
-    print("\n✅ Extraction complete! Saved to 'embeddings.pkl'.")
+    print(f"\n✅ Jobb A er ferdig! Fingeravtrykkene ligger trygt i S3: {EMBEDDINGS_KEY}")
 
 if __name__ == "__main__":
     main()
