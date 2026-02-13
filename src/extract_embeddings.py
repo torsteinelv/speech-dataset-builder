@@ -1,98 +1,110 @@
-import asyncio
-import pyaudio
-import time
-from wyoming.audio import AudioChunk, AudioStop
-from wyoming.client import AsyncTcpClient
-from wyoming.tts import SynthesizeStart, SynthesizeChunk, SynthesizeStop
+import os
+import json
+import boto3
+import pickle
+from pathlib import Path
+from dotenv import load_dotenv
+from pyannote.audio import Model, Inference
+from pydub import AudioSegment
 
-class MyVoice:
-    def __init__(self, name):
-        self.name = name
-        
-    def to_dict(self):
-        return {"name": self.name}
-
-async def main():
-    voice_name = "kathrine" 
+def main():
+    load_dotenv()
+    BUCKET = os.getenv("S3_BUCKET", "ml-data")
     
-    # Her kan du nå skrive hva du vil - kort eller langt!
-    text_to_speak = "Hei, hvordan går det med deg i dag? Er du klar for å bytte skjermkort?"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    )
 
-    server_host = "10.10.0.33"
-    server_port = 10200
+    print("🤖 Loading pyannote/embedding model...")
+    model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("HF_TOKEN"))
+    inference = Inference(model, window="whole")
 
-    print(f"Kobler til Wyoming-server på {server_host}:{server_port}...")
-    client = AsyncTcpClient(server_host, server_port)
+    # --- GJENOPPTA FREMDRIFT (RESUME) ---
+    all_embeddings = {}
+    pickle_file = "embeddings.pkl"
     
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True)
+    if os.path.exists(pickle_file):
+        print(f"📥 Found existing '{pickle_file}'. Loading previous progress...")
+        with open(pickle_file, "rb") as f:
+            all_embeddings = pickle.load(f)
+        print(f"   -> Loaded {len(all_embeddings)} fingerprints.")
+    else:
+        print("🆕 Starting fresh. No previous fingerprints found.")
 
-    try:
-        async with client:
-            voice_obj = MyVoice(voice_name)
-            start_time = time.perf_counter()
+    paginator = s3.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=BUCKET, Prefix="002_speech_dataset/processed/")
 
-            async def send_text():
-                print("📤 Sender tekst...")
-                await client.write_event(SynthesizeStart(voice=voice_obj).event())
-                words = text_to_speak.replace("\n", " ").split(" ")
+    print("🔍 Scanning episodes...")
+    for page in pages:
+        if 'Contents' not in page: continue
+        for obj in page['Contents']:
+            if not obj['Key'].endswith('.jsonl'): continue
+            
+            jsonl_key = obj['Key']
+            audio_key = jsonl_key.replace("processed/", "raw/").replace(".jsonl", ".mp3")
+            ep_name = jsonl_key.split("/")[-1].replace(".jsonl", "")
+
+            # Sjekk om vi allerede har behandlet denne episoden
+            # (Hvis noen av nøklene i ordboken starter med episodens navn)
+            already_processed = any(key.startswith(f"{ep_name}_") for key in all_embeddings.keys())
+            if already_processed:
+                print(f"⏩ Skipping: {ep_name} (Already processed)")
+                continue
+
+            print(f"\n🎧 Processing: {ep_name}")
+            
+            # 1. Read JSONL and find the longest clip per speaker
+            response = s3.get_object(Bucket=BUCKET, Key=jsonl_key)
+            content = response['Body'].read().decode('utf-8')
+            
+            speaker_clips = {}
+            for line in content.splitlines():
+                if line.strip():
+                    data = json.loads(line)
+                    spk = data['speaker']
+                    duration = data['end'] - data['start']
+                    
+                    if spk not in speaker_clips or duration > speaker_clips[spk]['duration']:
+                        speaker_clips[spk] = {'start': data['start'], 'end': data['end'], 'duration': duration}
+
+            if not speaker_clips: continue
+
+            # 2. Download audio temporarily
+            temp_audio = "temp_audio.mp3"
+            try:
+                s3.download_file(BUCKET, audio_key, temp_audio)
+            except Exception as e:
+                print(f"⚠️ Could not find audio for {audio_key}. Skipping.")
+                continue
+
+            audio = AudioSegment.from_file(temp_audio)
+
+            # 3. Create embeddings
+            for spk, times in speaker_clips.items():
+                start_ms = int(times['start'] * 1000)
+                end_ms = int(times['end'] * 1000)
+                clip = audio[start_ms:end_ms]
                 
-                for word in words:
-                    if word.strip():
-                        await client.write_event(SynthesizeChunk(text=word + " ").event())
-                        await asyncio.sleep(0.05) # Litt raskere sending
+                temp_clip = "temp_clip.wav"
+                clip.export(temp_clip, format="wav")
                 
-                await client.write_event(SynthesizeStop().event())
-                print("📤 Tekst ferdig sendt.")
+                unique_id = f"{ep_name}_{spk}"
+                embedding = inference(temp_clip)
+                all_embeddings[unique_id] = embedding
+                print(f"  👉 Extracted {spk} ({times['duration']:.1f} sec)")
 
-            async def receive_audio():
-                print("📥 Lytter etter lyd...")
-                first_chunk = True
-                is_playing = False
-                audio_buffer = []
-                buffer_limit = 15 # Maks buffer for lange tekster
+            # Cleanup files
+            os.remove(temp_audio)
+            if os.path.exists("temp_clip.wav"): os.remove("temp_clip.wav")
 
-                while True:
-                    event = await client.read_event()
-                    if event is None:
-                        break
+            # --- LAGRE ETTER HVER EPISODE ---
+            with open(pickle_file, "wb") as f:
+                pickle.dump(all_embeddings, f)
 
-                    if AudioChunk.is_type(event.type):
-                        if first_chunk:
-                            elapsed = time.perf_counter() - start_time
-                            print(f"\n⏱️ Respons: {elapsed:.2f}s")
-                            first_chunk = False
-                            
-                        chunk = AudioChunk.from_event(event)
-                        
-                        if not is_playing:
-                            audio_buffer.append(chunk.audio)
-                            # Start avspilling hvis bufferen er full
-                            if len(audio_buffer) >= buffer_limit:
-                                is_playing = True
-                                print(f"🔊 Buffer full ({buffer_limit} pakker). Starter avspilling...")
-                                for b in audio_buffer:
-                                    stream.write(b)
-                                audio_buffer = []
-                        else:
-                            stream.write(chunk.audio)
-                            
-                    elif AudioStop.is_type(event.type):
-                        # Tving avspilling av resten hvis vi ikke har startet enda
-                        if not is_playing and audio_buffer:
-                            print(f"🔊 Kort melding ferdig ({len(audio_buffer)} pakker). Spiller av...")
-                            for b in audio_buffer:
-                                stream.write(b)
-                        break
-                
-                print(f"⏱️ Totaltid: {time.perf_counter() - start_time:.2f}s")
-
-            await asyncio.gather(send_text(), receive_audio())
-
-    finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+    print("\n✅ Extraction complete! Saved to 'embeddings.pkl'.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
