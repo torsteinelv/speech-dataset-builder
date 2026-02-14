@@ -1,4 +1,4 @@
-# src/name_resolver.py
+# src/name_extractor.py
 from __future__ import annotations
 
 import argparse
@@ -70,15 +70,36 @@ def read_jsonl_text(text: str) -> List[Dict[str, Any]]:
 
 
 def extract_first_json_object(s: str) -> str:
-    """
-    Modell-output kan av og til komme med litt tekst rundt JSON.
-    Vi plukker ut første {...}-blokk på en defensiv måte.
-    """
     start = s.find("{")
     end = s.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Fant ikke JSON-objekt i LLM-respons.")
     return s[start : end + 1]
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def is_plausible_person_name(name: str) -> bool:
+    # Tillat norske bokstaver, bindestrek og apostrof.
+    # (Hold dette mildt – transkripsjon kan være lower-case.)
+    n = name.strip()
+    if not n:
+        return False
+    # Fjern "@" etc
+    n2 = re.sub(r"[^a-zA-ZÆØÅæøå\-\s']", " ", n)
+    n2 = re.sub(r"\s+", " ", n2).strip()
+    if not n2:
+        return False
+
+    tokens = [t for t in n2.split(" ") if len(t) >= 2]
+    # Fullt navn er best (2 tokens), men la én-token slippe gjennom om den er lang nok.
+    if len(tokens) >= 2:
+        return True
+    if len(tokens) == 1 and len(tokens[0]) >= 4:
+        return True
+    return False
 
 
 # -----------------------------
@@ -103,6 +124,9 @@ class Config:
     max_episode_lines: int
     max_speaker_lines: int
 
+    dominant_episode_frac: float
+    after_intro_window_s: float
+
     local_temp_dir: Path
 
     @property
@@ -112,10 +136,6 @@ class Config:
     @property
     def s3_global_prefix(self) -> str:
         return f"{self.s3_base_path}/{self.global_prefix}/"
-
-    @property
-    def s3_names_registry_key(self) -> str:
-        return f"{self.s3_global_prefix}names.jsonl"
 
 
 def load_config() -> Config:
@@ -136,10 +156,12 @@ def load_config() -> Config:
         llm_base_url=env_str("LLM_BASE_URL"),
         llm_api_key=env_str("LLM_API_KEY"),
         llm_model=env_str("LLM_MODEL", "gpt-4.1-mini"),
-        temperature=env_float("NAME_RESOLVER_TEMPERATURE", 0.0),
-        max_episode_lines=env_int("NAME_RESOLVER_MAX_EPISODE_LINES", 220),
-        max_speaker_lines=env_int("NAME_RESOLVER_MAX_SPEAKER_LINES", 40),
-        local_temp_dir=Path(env_str("LOCAL_TEMP_DIR", "temp_name_resolver")),
+        temperature=env_float("NAME_EXTRACTOR_TEMPERATURE", 0.0),
+        max_episode_lines=env_int("NAME_EXTRACTOR_MAX_EPISODE_LINES", 240),
+        max_speaker_lines=env_int("NAME_EXTRACTOR_MAX_SPEAKER_LINES", 40),
+        dominant_episode_frac=env_float("NAME_DOMINANT_EPISODE_FRAC", 0.35),
+        after_intro_window_s=env_float("NAME_AFTER_INTRO_WINDOW_S", 180.0),
+        local_temp_dir=Path(env_str("LOCAL_TEMP_DIR", "temp_name_extractor")),
     )
 
 
@@ -154,11 +176,11 @@ def get_s3_client(cfg: Config):
 
 
 # -----------------------------
-# LLM client (OpenAI-compatible Chat Completions)
+# LLM client (OpenAI-compatible)
 # -----------------------------
 def llm_chat(cfg: Config, messages: List[Dict[str, str]]) -> str:
     if not cfg.llm_base_url or not cfg.llm_api_key:
-        raise ValueError("LLM_BASE_URL/LLM_API_KEY mangler. (Sett dem i .env)")
+        raise ValueError("LLM_BASE_URL/LLM_API_KEY mangler (sett i .env).")
 
     url = cfg.llm_base_url.rstrip("/") + "/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cfg.llm_api_key}"}
@@ -174,105 +196,203 @@ def llm_chat(cfg: Config, messages: List[Dict[str, str]]) -> str:
 
 
 # -----------------------------
-# Name resolution
+# Prompt building
 # -----------------------------
-INTRO_PATTERNS = [
-    r"\bvelkommen\b",
-    r"\bmed oss\b",
-    r"\bgjest\b",
-    r"\bi studio\b",
-    r"\bi dag har vi\b",
-    r"\bdu hører på\b",
-    r"\bmitt navn\b",
-    r"\bjeg heter\b",
-]
+INTRO_PAT = re.compile(
+    r"\b(velkommen|med oss|gjest|i studio|i dag har vi|du hører på|mitt navn|jeg heter)\b",
+    re.IGNORECASE,
+)
 
 
-def build_episode_prompt_rows(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, Dict[str, List[Dict[str, Any]]]]:
+def episode_speaker_durations(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    d: Dict[str, float] = {}
+    for r in rows:
+        gid = r.get("global_speaker_id")
+        if not gid:
+            continue
+        try:
+            st = float(r.get("start", 0.0))
+            en = float(r.get("end", 0.0))
+            dur = max(0.0, en - st)
+        except Exception:
+            continue
+        d[str(gid)] = d.get(str(gid), 0.0) + dur
+    return d
+
+
+def dominant_speaker(rows: List[Dict[str, Any]], dominant_frac: float) -> Tuple[Optional[str], float]:
+    d = episode_speaker_durations(rows)
+    if not d:
+        return None, 0.0
+    total = sum(d.values())
+    if total <= 1e-6:
+        return None, 0.0
+    gid = max(d, key=lambda k: d[k])
+    frac = d[gid] / total
+    if frac >= dominant_frac:
+        return gid, frac
+    return None, frac
+
+
+def build_lines_with_ids(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """
+    Lager tekst til LLM med line-id som vi kan validere hardt mot.
     Returnerer:
-      - episode_snippet: tekst med utvalgte linjer
-      - per_speaker_lines: {global_speaker_id: [linjer]}
+      - snippet
+      - line_index: { "L0001": {"gid":..., "start":..., "end":..., "text":...} }
     """
-    # 1) Ta de første N linjene som “kontekst”
+    # 1) startlinjer
     first = rows[: cfg.max_episode_lines]
 
-    # 2) Ta alle “intro-liknende” linjer i hele episoden (begrenset)
-    intro_lines: List[Dict[str, Any]] = []
-    pat = re.compile("|".join(INTRO_PATTERNS), re.IGNORECASE)
+    # 2) intro-linjer (fra hele episoden, begrenset)
+    intro: List[Dict[str, Any]] = []
     for r in rows:
         txt = str(r.get("text", "")).strip()
-        if not txt:
-            continue
-        if pat.search(txt):
-            intro_lines.append(r)
-        if len(intro_lines) >= cfg.max_episode_lines:
+        if txt and INTRO_PAT.search(txt):
+            intro.append(r)
+        if len(intro) >= cfg.max_episode_lines:
             break
 
-    # 3) Per speaker: første M linjer + linjer med “jeg heter / mitt navn”
+    # 3) per speaker: første M linjer
     per: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         gid = r.get("global_speaker_id")
         if not gid:
             continue
+        gid = str(gid)
         per.setdefault(gid, [])
         if len(per[gid]) < cfg.max_speaker_lines:
             per[gid].append(r)
 
-    # Ekstra: linjer som matcher sterke self-ID mønstre
-    strong_pat = re.compile(r"\bjeg heter\b|\bmitt navn\b", re.IGNORECASE)
-    for r in rows:
-        gid = r.get("global_speaker_id")
-        if not gid:
-            continue
-        if strong_pat.search(str(r.get("text", ""))):
-            per.setdefault(gid, [])
-            per[gid].append(r)
-
-    # bygg snippet tekst
-    def fmt_line(r: Dict[str, Any]) -> str:
-        return (
-            f"[{r.get('start', 0):.2f}-{r.get('end', 0):.2f}] "
-            f"{r.get('global_speaker_id') or 'NO_GID'} "
-            f"(local={r.get('speaker')}): {str(r.get('text', '')).strip()}"
-        )
-
-    lines_out: List[str] = []
-    lines_out.append("=== FIRST_LINES ===")
-    lines_out.extend(fmt_line(r) for r in first)
-
-    lines_out.append("\n=== INTRO_LINES ===")
-    # dedup litt
+    # slå sammen (dedup på (start,end,gid,text))
+    merged: List[Dict[str, Any]] = []
     seen = set()
-    for r in intro_lines:
-        k = (r.get("start"), r.get("end"), r.get("global_speaker_id"), r.get("text"))
-        if k in seen:
-            continue
-        seen.add(k)
-        lines_out.append(fmt_line(r))
+    def add_many(items: List[Dict[str, Any]]):
+        for r in items:
+            k = (r.get("start"), r.get("end"), r.get("global_speaker_id"), r.get("text"))
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(r)
 
-    lines_out.append("\n=== PER_SPEAKER_SAMPLES ===")
+    add_many(first)
+    add_many(intro)
+    # ta litt per speaker, men ikke eksploder
     for gid, items in per.items():
-        lines_out.append(f"\n-- SPEAKER {gid} --")
-        # sort på tid, og ta maks M
-        items_sorted = sorted(items, key=lambda x: float(x.get("start", 0.0)))
-        for r in items_sorted[: cfg.max_speaker_lines]:
-            lines_out.append(fmt_line(r))
+        add_many(sorted(items, key=lambda x: float(x.get("start", 0.0)))[: cfg.max_speaker_lines])
 
-    return "\n".join(lines_out), per
+    merged.sort(key=lambda x: float(x.get("start", 0.0)))
+
+    line_index: Dict[str, Dict[str, Any]] = {}
+    out_lines: List[str] = []
+    for i, r in enumerate(merged, start=1):
+        lid = f"L{i:04d}"
+        gid = r.get("global_speaker_id") or "NO_GID"
+        st = float(r.get("start", 0.0))
+        en = float(r.get("end", 0.0))
+        txt = str(r.get("text", "")).strip()
+        out_lines.append(f"{lid}|[{st:.2f}-{en:.2f}]|{gid}|{txt}")
+        line_index[lid] = {"gid": str(gid), "start": st, "end": en, "text": txt}
+
+    snippet = "\n".join(out_lines)
+    return snippet, line_index
 
 
-def resolve_names_for_episode(cfg: Config, audio_file: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    snippet, _ = build_episode_prompt_rows(rows, cfg)
+# -----------------------------
+# Validation (anti-hallusinasjon + anti-Gunvor/Torstein)
+# -----------------------------
+def speaker_speaks_soon_after(rows: List[Dict[str, Any]], gid: str, t: float, window_s: float) -> bool:
+    t1 = t + window_s
+    for r in rows:
+        if str(r.get("global_speaker_id")) != gid:
+            continue
+        try:
+            st = float(r.get("start", 0.0))
+        except Exception:
+            continue
+        if st >= t and st <= t1:
+            return True
+    return False
 
+
+def validate_assignment(
+    rows: List[Dict[str, Any]],
+    line_index: Dict[str, Dict[str, Any]],
+    dominant_gid: Optional[str],
+    cfg: Config,
+    a: Dict[str, Any],
+) -> Tuple[bool, str]:
+    gid = str(a.get("global_speaker_id", "")).strip()
+    name = str(a.get("name", "")).strip()
+    ev = a.get("evidence", {}) or {}
+    line_id = str(ev.get("line_id", "")).strip()
+    ev_type = str(ev.get("type", "")).strip().lower()
+
+    if not gid or not name or not line_id:
+        return False, "missing_fields"
+
+    if not is_plausible_person_name(name):
+        return False, "name_not_plausible"
+
+    li = line_index.get(line_id)
+    if not li:
+        return False, "line_id_not_found"
+
+    line_gid = str(li["gid"])
+    line_text = str(li["text"])
+
+    # quote må finnes i teksten på den linjen
+    quote = str(ev.get("quote", "")).strip()
+    if not quote or quote not in line_text:
+        return False, "quote_not_in_line_text"
+
+    # navn bør også finnes på linjen (case-insensitive) – ellers er det ofte hallus
+    if name.lower() not in line_text.lower():
+        return False, "name_not_in_evidence_line"
+
+    if ev_type not in {"self_intro", "host_intro"}:
+        return False, "bad_evidence_type"
+
+    # Sterke regler:
+    if ev_type == "self_intro":
+        # Self intro må være samme speaker som subject
+        if gid != line_gid:
+            return False, "self_intro_gid_mismatch"
+        # Self intro bør inneholde "jeg heter"/"mitt navn"
+        if not re.search(r"\b(jeg heter|mitt navn)\b", line_text, re.IGNORECASE):
+            return False, "self_intro_missing_phrase"
+        return True, "ok"
+
+    # host_intro
+    # Host intro skal normalt være sagt av en annen speaker enn subject.
+    if gid == line_gid:
+        return False, "host_intro_same_speaker"
+
+    # aldri gi host_intro-navn til dominant speaker (Gunvor/Torstein-sperre)
+    if dominant_gid and gid == dominant_gid:
+        return False, "host_intro_targets_dominant"
+
+    # subject må faktisk snakke kort tid etter introen (turn-taking)
+    t_after = float(li["end"])
+    if not speaker_speaks_soon_after(rows, gid, t_after, cfg.after_intro_window_s):
+        return False, "subject_not_speaking_soon_after_intro"
+
+    return True, "ok"
+
+
+# -----------------------------
+# LLM extraction
+# -----------------------------
+def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dict[str, Any]:
     system = (
-        "Du er et system som trekker ut navn på podcast-deltakere basert på tekstbevis.\n"
-        "VIKTIG:\n"
-        "- Du får kun et utdrag av transkripsjonen med speaker-id og tidsstempler.\n"
-        "- Du MÅ kun foreslå et navn hvis navnet er eksplisitt nevnt i utdraget.\n"
-        "- Du MÅ inkludere et sitat (quote) som er et eksakt utdrag fra input.\n"
-        "- Hvis du ikke finner eksplisitt bevis: returner unknown.\n"
-        "- Ikke gjett.\n"
+        "Du trekker ut navn på personer i en podcast basert KUN på eksplisitt tekstbevis.\n"
+        "Du får linjer formatert som:\n"
+        "  L0001|[start-end]|global_speaker_id|tekst\n\n"
+        "KRAV:\n"
+        "- Ikke gjett navn.\n"
+        "- Returner kun navn som står eksplisitt i en evidence-linje.\n"
+        "- Hver assignment MÅ ha evidence: line_id, quote (må være eksakt substring av linjens tekst), type.\n"
+        "- type må være 'self_intro' (personen sier selv 'jeg heter ...') eller 'host_intro' (en annen speaker introduserer personen).\n"
         "Svar KUN med ett JSON-objekt."
     )
 
@@ -281,18 +401,23 @@ def resolve_names_for_episode(cfg: Config, audio_file: str, rows: List[Dict[str,
         "Her er utdraget:\n"
         f"{snippet}\n\n"
         "Oppgave:\n"
-        "1) Finn hvilke global_speaker_id som kan knyttes til et personnavn.\n"
-        "2) For hver: gi name, confidence (0-1), quote, start, end, og en kort reason.\n"
-        "3) Returner også en liste over speaker-id som forblir unknown.\n\n"
+        "Finn hvilke global_speaker_id som kan knyttes til et personnavn.\n\n"
         "JSON-skjema:\n"
         "{\n"
         '  "episode": "...",\n'
         '  "assignments": [\n'
         "    {\n"
         '      "global_speaker_id": "spk_...",\n'
-        '      "name": "Fullt Navn",\n'
+        '      "name": "Navn Som Står I Teksten",\n'
         '      "confidence": 0.0,\n'
-        '      "evidence": {"quote": "...", "start": 0.0, "end": 0.0, "reason": "..."}\n'
+        '      "evidence": {\n'
+        '        "type": "self_intro|host_intro",\n'
+        '        "line_id": "L0001",\n'
+        '        "quote": "eksakt substring fra linjen",\n'
+        '        "start": 0.0,\n'
+        '        "end": 0.0,\n'
+        '        "reason": "kort begrunnelse"\n'
+        "      }\n"
         "    }\n"
         "  ],\n"
         '  "unknown": ["spk_...", "..."]\n'
@@ -301,86 +426,19 @@ def resolve_names_for_episode(cfg: Config, audio_file: str, rows: List[Dict[str,
 
     content = llm_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}])
     obj = json.loads(extract_first_json_object(content))
-
-    # Valider “quote” finnes faktisk i snippet (anti-hallusinasjon)
-    snippet_text = snippet
-    ok_assignments: List[Dict[str, Any]] = []
-    for a in obj.get("assignments", []):
-        ev = a.get("evidence", {}) or {}
-        quote = str(ev.get("quote", "")).strip()
-        if not quote:
-            continue
-        if quote not in snippet_text:
-            # dropp hvis quote ikke er eksakt
-            continue
-        ok_assignments.append(a)
-
-    obj["assignments"] = ok_assignments
+    if "assignments" not in obj:
+        obj["assignments"] = []
+    if "unknown" not in obj:
+        obj["unknown"] = []
     return obj
 
 
-def load_names_registry(s3, cfg: Config) -> Dict[str, Dict[str, Any]]:
-    if not s3_exists(s3, cfg.s3_bucket, cfg.s3_names_registry_key):
-        return {}
-    tmp = cfg.local_temp_dir / "names.jsonl"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    s3.download_file(cfg.s3_bucket, cfg.s3_names_registry_key, str(tmp))
-
-    registry: Dict[str, Dict[str, Any]] = {}
-    for line in tmp.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        r = json.loads(line)
-        gid = r["global_speaker_id"]
-        registry[gid] = r
-    return registry
-
-
-def save_names_registry(s3, cfg: Config, registry: Dict[str, Dict[str, Any]]) -> None:
-    tmp = cfg.local_temp_dir / "names.jsonl"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    with tmp.open("w", encoding="utf-8") as f:
-        for gid in sorted(registry.keys()):
-            json.dump(registry[gid], f, ensure_ascii=False)
-            f.write("\n")
-    s3.upload_file(str(tmp), cfg.s3_bucket, cfg.s3_names_registry_key)
-
-
-def update_registry_with_episode(registry: Dict[str, Dict[str, Any]], episode_result: Dict[str, Any]) -> None:
-    ep = str(episode_result.get("episode", ""))
-    for a in episode_result.get("assignments", []):
-        gid = str(a.get("global_speaker_id", "")).strip()
-        name = str(a.get("name", "")).strip()
-        conf = float(a.get("confidence", 0.0))
-        ev = a.get("evidence", {}) or {}
-
-        if not gid or not name:
-            continue
-
-        rec = registry.get(gid) or {"global_speaker_id": gid, "candidates": [], "canonical_name": None, "canonical_confidence": 0.0}
-        rec["candidates"].append(
-            {
-                "episode": ep,
-                "name": name,
-                "confidence": conf,
-                "evidence": ev,
-            }
-        )
-
-        # oppdater canonical hvis høyere confidence
-        if conf >= float(rec.get("canonical_confidence", 0.0)):
-            rec["canonical_name"] = name
-            rec["canonical_confidence"] = conf
-
-        registry[gid] = rec
-
-
-def process_episode_file(s3, cfg: Config, key: str, names_registry: Dict[str, Dict[str, Any]]) -> None:
+def process_one_episode(s3, cfg: Config, key: str) -> None:
     relative = key.replace(cfg.s3_processed_global_prefix, "", 1)  # podcast/episode.jsonl
-    cache_key = f"{cfg.s3_global_prefix}name_cache/{relative[:-5]}.json"  # drop .jsonl
+    cache_key = f"{cfg.s3_global_prefix}name_cache/{relative[:-5]}.json"
 
     if s3_exists(s3, cfg.s3_bucket, cache_key):
-        print(f"SKIP (name cache finnes): {relative}")
+        print(f"SKIP (cache finnes): {relative}")
         return
 
     obj = s3.get_object(Bucket=cfg.s3_bucket, Key=key)
@@ -390,22 +448,47 @@ def process_episode_file(s3, cfg: Config, key: str, names_registry: Dict[str, Di
         print(f"ADVARSEL: tom {relative}")
         return
 
-    audio_file = str(rows[0].get("audio_file", ""))
-    res = resolve_names_for_episode(cfg, audio_file, rows)
+    audio_file = str(rows[0].get("audio_file", "")).strip()
 
-    # lagre cache
-    tmp = cfg.local_temp_dir / "cache" / f"{relative[:-5]}.json"
+    snippet, line_index = build_lines_with_ids(rows, cfg)
+    dom_gid, dom_frac = dominant_speaker(rows, cfg.dominant_episode_frac)
+
+    llm_res = resolve_names_for_episode(cfg, audio_file, snippet)
+
+    valid: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+
+    for a in llm_res.get("assignments", []):
+        ok, reason = validate_assignment(rows, line_index, dom_gid, cfg, a)
+        conf = clamp01(float(a.get("confidence", 0.0)))
+        a["confidence"] = conf
+        a["_validation"] = {"ok": ok, "reason": reason}
+        if ok:
+            valid.append(a)
+        else:
+            rejected.append(a)
+
+    out = {
+        "episode_key": key,
+        "audio_file": audio_file,
+        "podcast": audio_file.split("/")[0] if "/" in audio_file else None,
+        "dominant_gid": dom_gid,
+        "dominant_frac": dom_frac,
+        "valid_assignments": valid,
+        "rejected_assignments": rejected,
+        "unknown": llm_res.get("unknown", []),
+    }
+
+    tmp = cfg.local_temp_dir / "name_cache" / f"{relative[:-5]}.json"
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     s3.upload_file(str(tmp), cfg.s3_bucket, cache_key)
 
-    # oppdater global names registry
-    update_registry_with_episode(names_registry, res)
-    print(f"OK: {relative} (assignments={len(res.get('assignments', []))})")
+    print(f"OK: {relative} valid={len(valid)} rejected={len(rejected)} dom={dom_gid}({dom_frac:.2f})")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Resolve human names for global speakers using LLM + evidence.")
+    parser = argparse.ArgumentParser(description="Fase 1: Ekstraher navnebevis per episode til S3 cache.")
     parser.add_argument("--max-files", type=int, default=0, help="Begrens antall episoder (0=ingen grense).")
     args = parser.parse_args()
 
@@ -419,13 +502,9 @@ def main() -> None:
     if args.max_files and args.max_files > 0:
         keys = keys[: args.max_files]
 
-    names_registry = load_names_registry(s3, cfg)
-
     for i, k in enumerate(keys, start=1):
         print(f"[{i}/{len(keys)}] {k}")
-        process_episode_file(s3, cfg, k, names_registry)
-        # lagre ofte
-        save_names_registry(s3, cfg, names_registry)
+        process_one_episode(s3, cfg, k)
 
     print("Ferdig.")
 
