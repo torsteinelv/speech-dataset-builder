@@ -1,4 +1,3 @@
-# src/speaker_indexer.py
 from __future__ import annotations
 
 import argparse
@@ -13,6 +12,23 @@ import boto3
 import numpy as np
 import torch
 from dotenv import load_dotenv
+
+# --- MONKEY PATCH START (Må være før pyannote imports) ---
+# Dette fikser "TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'"
+import huggingface_hub
+
+# Vi tar vare på den originale funksjonen
+_original_hf_hub_download = huggingface_hub.hf_hub_download
+
+def _patched_hf_hub_download(*args, **kwargs):
+    # Hvis gamle biblioteker sender 'use_auth_token', bytter vi navn til 'token'
+    if "use_auth_token" in kwargs:
+        kwargs["token"] = kwargs.pop("use_auth_token")
+    return _original_hf_hub_download(*args, **kwargs)
+
+# Vi erstatter funksjonen i biblioteket med vår fikset versjon
+huggingface_hub.hf_hub_download = _patched_hf_hub_download
+# --- MONKEY PATCH SLUTT ---
 
 from pyannote.audio import Model, Inference
 from pyannote.core import Segment
@@ -196,6 +212,7 @@ class SpeakerEmbedder:
         if hf_token:
             kwargs["token"] = hf_token
 
+        # Her vil monkey-patchen over fikse kallet hvis pyannote bruker use_auth_token internt
         self.model = Model.from_pretrained(model_id, **kwargs)
         self.inference = Inference(self.model, window="whole")
         self.inference.to(torch.device(device))
@@ -210,17 +227,6 @@ class SpeakerEmbedder:
 # -----------------------------
 # Registry format
 # -----------------------------
-# registry.jsonl linje:
-# {
-#   "global_speaker_id": "spk_xxx",
-#   "embedding": [...],            # L2-normalisert
-#   "n_examples": 17,
-#   "total_seconds": 421.3,
-#   "created_at": "2026-02-14T12:34:56Z",
-#   "updated_at": "..."
-# }
-
-
 def load_registry(s3, cfg: Config) -> List[Dict[str, Any]]:
     if not s3_exists(s3, cfg.s3_bucket, cfg.s3_global_registry_key):
         return []
@@ -270,8 +276,6 @@ def pick_embedding_windows(
 ) -> List[Tuple[float, float, float]]:
     """
     Returnerer liste av (start, end, weight) for embedding.
-    Vi bruker en kort "vindusbit" (typisk ~3s) rundt midten av gode segmenter,
-    fordi embeddings ofte blir mer stabile enn å bruke hele (lange) turns.
     """
     cands: List[Tuple[float, float, float, float]] = []  # start, end, score, dur
     for s in segments:
@@ -287,7 +291,6 @@ def pick_embedding_windows(
         except Exception:
             continue
 
-    # vekt: lengde * score (prioriterer renere+lengre)
     cands.sort(key=lambda x: (x[3] * x[2]), reverse=True)
 
     picked: List[Tuple[float, float, float]] = []
@@ -304,7 +307,7 @@ def pick_embedding_windows(
         wst = max(st, mid - win / 2.0)
         wen = min(en, mid + win / 2.0)
 
-        weight = win  # vekt per embedding i centroid
+        weight = win
         picked.append((wst, wen, weight))
         total += win
 
@@ -343,20 +346,10 @@ def process_one_episode(
     registry: List[Dict[str, Any]],
     processed_key: str,
 ) -> None:
-    """
-    Tar:
-      s3://bucket/<base>/processed/<podcast>/<episode>.jsonl
-
-    Lager:
-      s3://bucket/<base>/processed_global/<podcast>/<episode>.jsonl
-      s3://bucket/<base>/global/links/<podcast>/<episode>.json
-    og oppdaterer registry.jsonl
-    """
     relative = processed_key.replace(cfg.s3_processed_prefix, "", 1)  # podcast/episode.jsonl
     out_processed_key = f"{cfg.s3_processed_global_prefix}{relative}"
     link_key = f"{cfg.s3_global_prefix}links/{relative[:-5]}.json"  # drop ".jsonl" -> ".json"
 
-    # idempotens: hvis processed_global finnes, skip
     if s3_exists(s3, cfg.s3_bucket, out_processed_key) and s3_exists(s3, cfg.s3_bucket, link_key):
         print(f"SKIP (global ferdig): {relative}")
         return
@@ -370,7 +363,6 @@ def process_one_episode(
         print(f"ADVARSEL: tom fil {relative}")
         return
 
-    # audio_file er relativ mp3-sti i raw/
     audio_rel = str(rows[0].get("audio_file", "")).strip()
     if not audio_rel:
         print(f"ADVARSEL: mangler audio_file i {relative}")
@@ -382,7 +374,6 @@ def process_one_episode(
     if not local_mp3.exists():
         s3.download_file(cfg.s3_bucket, raw_key, str(local_mp3))
 
-    # grupper på lokal speaker
     groups = group_by_local_speaker(rows)
 
     link_result: Dict[str, Any] = {
@@ -391,11 +382,8 @@ def process_one_episode(
         "links": [],
     }
 
-    # Vi bygger et in-memory index for raskere matching
-    # (for store datasett -> FAISS/pgvector; her holder det)
     for local_spk, segs in groups.items():
         if local_spk.lower() == "unknown":
-            # diarization manglet/feilet: ikke prøv å global-linke
             link_result["links"].append(
                 {
                     "local_speaker": local_spk,
@@ -439,7 +427,6 @@ def process_one_episode(
             )
             continue
 
-        # compute segment embeddings
         embs: List[np.ndarray] = []
         weights: List[float] = []
         for st, en, w in windows:
@@ -462,11 +449,9 @@ def process_one_episode(
             )
             continue
 
-        # weighted centroid
         W = float(sum(weights))
         centroid = normalize(sum(v * w for v, w in zip(embs, weights)) / max(W, 1e-6))
 
-        # match mot registry
         best, sim = best_match(centroid, registry)
 
         decision: str
@@ -520,8 +505,6 @@ def process_one_episode(
                 )
 
             else:
-                # REVIEW: vi oppretter NY global ID for å unngå false merge,
-                # men logger beste kandidat slik at en senere jobb/GUI kan foreslå merge.
                 decision = "review"
                 assigned_id = make_global_id()
                 registry.append(
@@ -548,14 +531,12 @@ def process_one_episode(
             }
         )
 
-    # lag mapping dict
     mapping: Dict[str, str] = {
         x["local_speaker"]: x["global_speaker_id"]
         for x in link_result["links"]
         if x.get("global_speaker_id") is not None
     }
 
-    # skriv processed_global jsonl
     out_rows: List[Dict[str, Any]] = []
     for r in rows:
         rr = dict(r)
@@ -566,7 +547,6 @@ def process_one_episode(
     write_jsonl(local_out, out_rows)
     s3.upload_file(str(local_out), cfg.s3_bucket, out_processed_key)
 
-    # skriv link json
     local_link = cfg.local_temp_dir / "links" / f"{relative[:-5]}.json"
     local_link.parent.mkdir(parents=True, exist_ok=True)
     local_link.write_text(json.dumps(link_result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -591,7 +571,6 @@ def main() -> None:
     if args.max_files and args.max_files > 0:
         keys = keys[: args.max_files]
 
-    # load registry (single-writer antakelse)
     registry = load_registry(s3, cfg)
     print(f"Registry loaded: {len(registry)} globale speakere.")
 
@@ -600,7 +579,6 @@ def main() -> None:
     for i, k in enumerate(keys, start=1):
         print(f"[{i}/{len(keys)}] {k}")
         process_one_episode(s3, cfg, embedder, registry, k)
-        # lagre registry ofte (crash-sikkert)
         save_registry(s3, cfg, registry)
 
     print("Ferdig.")
