@@ -5,11 +5,29 @@ import torch
 import numpy as np
 import pickle
 import time
-from pyannote.audio import Model, Inference
-from pydub import AudioSegment
 from io import BytesIO
 from collections import defaultdict
 from dotenv import load_dotenv
+from pydub import AudioSegment
+
+# --- MONKEY PATCH START (Må være øverst) ---
+# Dette fikser "TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'"
+import huggingface_hub
+
+# Vi tar vare på den originale funksjonen
+_original_hf_hub_download = huggingface_hub.hf_hub_download
+
+def _patched_hf_hub_download(*args, **kwargs):
+    # Hvis gamle biblioteker sender 'use_auth_token', bytter vi navn til 'token'
+    if "use_auth_token" in kwargs:
+        kwargs["token"] = kwargs.pop("use_auth_token")
+    return _original_hf_hub_download(*args, **kwargs)
+
+# Vi erstatter funksjonen i biblioteket med vår fikset versjon
+huggingface_hub.hf_hub_download = _patched_hf_hub_download
+# --- MONKEY PATCH SLUTT ---
+
+from pyannote.audio import Model, Inference
 
 def main():
     load_dotenv()
@@ -28,7 +46,8 @@ def main():
                       aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"))
 
     print("🚀 Laster Pyannote embedding-modell...")
-    # --- FIX: Bruker 'token' i stedet for 'use_auth_token' ---
+    # Vi bruker 'token' her (det er riktig i nyere versjoner), 
+    # og monkey-patchen over fikser de interne kallene som bruker feil navn.
     model = Model.from_pretrained("pyannote/embedding", token=HF_TOKEN)
     inference = Inference(model, window="whole")
     
@@ -45,7 +64,7 @@ def main():
         embeddings_map = pickle.loads(resp['Body'].read())
         print(f"📥 Resume: Lastet {len(embeddings_map)} eksisterende embeddings.")
     except:
-        print("✨ Starter med blanke ark (Ingen embeddings funnet).")
+        print("✨ Starter med blanke ark (Ingen embeddings funnet i metadata-mappen).")
 
     # Hent liste over alle ferdige episoder
     processed_files = []
@@ -66,7 +85,7 @@ def main():
     for jsonl_key in processed_files:
         ep_name = jsonl_key.split("/")[-1].replace(".jsonl", "")
         
-        # Sjekk om episoden allerede er i minnet
+        # Sjekk om episoden allerede er i minnet (Resume-sjekk)
         if any(k.startswith(ep_name) for k in embeddings_map.keys()):
             continue
 
@@ -80,7 +99,7 @@ def main():
             # Last lyd (MP3)
             audio_key = jsonl_key.replace("processed/", "raw/").replace(".jsonl", ".mp3")
             audio_obj = s3.get_object(Bucket=BUCKET, Key=audio_key)
-            # Laster hele filen i minnet (raskere for slicing)
+            # Laster hele filen i minnet (raskere for slicing med pydub)
             audio = AudioSegment.from_file(BytesIO(audio_obj['Body'].read()))
         except Exception as e:
             print(f"   ❌ Feil ved nedlasting av {ep_name}: {e}")
@@ -91,19 +110,20 @@ def main():
         for line in transcript_lines:
             data = json.loads(line)
             duration = data['end'] - data['start']
-            # Vi ignorerer klipp under 2 sekunder for embedding
+            # Vi ignorerer klipp under 2 sekunder for embedding (for dårlig kvalitet/for lite data)
             if duration > 2.0: 
                 speaker_segments[data['speaker']].append((data['start'], data['end'], duration))
 
         # Prosesser hver speaker i episoden
         for speaker, segments in speaker_segments.items():
-            # Sorter etter lengde (lengst først)
+            # Sorter etter lengde (lengst først -> best kvalitet)
             segments.sort(key=lambda x: x[2], reverse=True)
             
             # Ta de N beste klippene
             top_segments = segments[:NUM_SAMPLES]
             
             vectors = []
+            total_duration_used = 0
             
             for start, end, dur in top_segments:
                 start_ms = int(start * 1000)
@@ -111,9 +131,10 @@ def main():
                 
                 # Klipp ut lyden
                 chunk = audio[start_ms:end_ms]
+                # Pyannote forventer 16kHz mono
                 chunk = chunk.set_frame_rate(16000).set_channels(1)
                 
-                # Lagre til midlertidig fil
+                # Lagre til midlertidig fil i RAM-disk (/tmp)
                 chunk.export("/tmp/clip.wav", format="wav")
                 
                 # Kjør AI-modellen
@@ -121,35 +142,40 @@ def main():
                     with torch.no_grad():
                         embedding = inference("/tmp/clip.wav")
                         vectors.append(embedding)
+                        total_duration_used += dur
                 except Exception as e:
-                    print(f"      ⚠️ Feil ved embedding: {e}")
+                    print(f"      ⚠️ Feil ved embedding av klipp: {e}")
 
             if vectors:
-                # Regn ut gjennomsnittet (Centroid)
+                # ✨ MAGIEN: Regn ut gjennomsnittet av alle vektorene (Centroid)
+                # Dette lager et mye mer stabilt "bilde" av stemmen enn bare ett klipp.
                 mean_vector = np.mean(vectors, axis=0)
                 
-                # Lagre resultatet
+                # Lagre resultatet med unik ID
                 unique_id = f"{ep_name}_{speaker}"
                 embeddings_map[unique_id] = mean_vector
-                print(f"   👉 {speaker}: Snitt av {len(vectors)} klipp")
+                print(f"   👉 {speaker}: Snitt av {len(vectors)} klipp ({total_duration_used:.1f}s)")
 
         episodes_since_save += 1
 
         # --- BATCH LAGRING ---
         if episodes_since_save >= BATCH_SIZE:
-            print(f"💾 Lagrer checkpoint til S3 ({len(embeddings_map)} totalt)...")
-            s3.put_object(Bucket=BUCKET, Key=f"{BASE_PATH}/metadata/embeddings.pkl", Body=pickle.dumps(embeddings_map))
-            episodes_since_save = 0
-            
-            elapsed = time.time() - start_time
-            print(f"⏱️  Tid brukt så langt: {int(elapsed//60)} minutter.")
+            print(f"💾 Lagrer checkpoint til S3 ({len(embeddings_map)} embeddings totalt)...")
+            try:
+                s3.put_object(Bucket=BUCKET, Key=f"{BASE_PATH}/metadata/embeddings.pkl", Body=pickle.dumps(embeddings_map))
+                episodes_since_save = 0
+                
+                elapsed = time.time() - start_time
+                print(f"⏱️  Tid brukt så langt: {int(elapsed//60)} minutter.")
+            except Exception as e:
+                print(f"❌ Kunne ikke lagre til S3: {e}")
 
-    # Lagre helt til slutt
+    # Lagre helt til slutt hvis det er usavede endringer
     if episodes_since_save > 0:
         print("💾 Lagrer siste rest til S3...")
         s3.put_object(Bucket=BUCKET, Key=f"{BASE_PATH}/metadata/embeddings.pkl", Body=pickle.dumps(embeddings_map))
 
-    print("\n✅ JOBB A FERDIG! Nå er embeddings mye mer robuste.")
+    print("\n✅ JOBB A FERDIG! Embeddings er lagret og klare for Jobb B.")
 
 if __name__ == "__main__":
     main()
