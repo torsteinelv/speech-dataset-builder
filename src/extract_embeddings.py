@@ -1,66 +1,44 @@
 import os
 import json
 import boto3
+import torch
+import numpy as np
 import pickle
-import botocore
-
-# ==========================================
-# MAGISK FIKS (MONKEY PATCH)
-# ==========================================
-import huggingface_hub
-_original_hf_download = huggingface_hub.hf_hub_download
-
-def _patched_hf_download(*args, **kwargs):
-    if "use_auth_token" in kwargs:
-        kwargs["token"] = kwargs.pop("use_auth_token")
-    return _original_hf_download(*args, **kwargs)
-
-huggingface_hub.hf_hub_download = _patched_hf_download
-# ==========================================
-
-import torch  # <-- NY: Importerer PyTorch
 from pyannote.audio import Model, Inference
 from pydub import AudioSegment
+from io import BytesIO
+from collections import defaultdict
 
 def main():
-    # Hent miljøvariabler
+    # Oppsett
     BUCKET = os.getenv("S3_BUCKET", "ml-data")
     BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
-    EMBEDDINGS_KEY = f"{BASE_PATH}/metadata/embeddings.pkl"
+    HF_TOKEN = os.getenv("HF_TOKEN")
     
-    print("🔌 Kobler til S3...")
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=os.getenv("S3_ENDPOINT_URL"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
+    # Hvor mange klipp skal vi basere gjennomsnittet på?
+    NUM_SAMPLES = 5 
 
-    print("🤖 Laster inn pyannote/embedding modell...")
-    
-    model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("HF_TOKEN"))
-    
-    # <-- NY: TVINGER MODELLEN OVER PÅ GPU (CUDA) -->
-    print("🚀 Flytter modellen til GPU (CUDA)...")
-    model.to(torch.device("cuda"))
-    
+    s3 = boto3.client("s3", endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+                      aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                      aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"))
+
+    print("🚀 Laster Pyannote embedding-modell...")
+    model = Model.from_pretrained("pyannote/embedding", use_auth_token=HF_TOKEN)
     inference = Inference(model, window="whole")
-
-    # --- GJENOPPTA FREMDRIFT FRA S3 ---
-    all_embeddings = {}
     
-    try:
-        print(f"📥 Sjekker om {EMBEDDINGS_KEY} finnes i S3...")
-        response = s3.get_object(Bucket=BUCKET, Key=EMBEDDINGS_KEY)
-        all_embeddings = pickle.loads(response['Body'].read())
-        print(f"   -> Fant eksisterende fil! Lastet inn {len(all_embeddings)} fingeravtrykk.")
-    except botocore.exceptions.ClientError as e:
-        if e.response['Error']['Code'] == "NoSuchKey":
-            print("🆕 Fant ingen tidligere data. Starter med blanke ark.")
-        else:
-            raise e
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    print(f"✅ Modell lastet på {device}")
 
-    print("🔍 Leter etter prosesserte episoder...")
+    # Last eksisterende embeddings hvis vi skal fortsette en jobb
+    embeddings_map = {}
+    try:
+        resp = s3.get_object(Bucket=BUCKET, Key=f"{BASE_PATH}/embeddings.pkl")
+        embeddings_map = pickle.loads(resp['Body'].read())
+        print(f"📥 Lastet {len(embeddings_map)} eksisterende embeddings.")
+    except:
+        print("✨ Starter ny embeddings-database.")
+
     paginator = s3.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{BASE_PATH}/processed/")
 
@@ -70,69 +48,72 @@ def main():
             if not obj['Key'].endswith('.jsonl'): continue
             
             jsonl_key = obj['Key']
-            audio_key = jsonl_key.replace("processed/", "raw/").replace(".jsonl", ".mp3")
             ep_name = jsonl_key.split("/")[-1].replace(".jsonl", "")
-
-            # Sjekk om episoden allerede er prosessert i minnet
-            already_processed = any(key.startswith(f"{ep_name}_") for key in all_embeddings.keys())
-            if already_processed:
-                print(f"⏩ Hopper over: {ep_name} (Allerede prosessert)")
+            
+            # Sjekk om vi allerede har behandlet denne episoden
+            # Vi sjekker om noen nøkler i kartet starter med ep_name
+            if any(k.startswith(ep_name) for k in embeddings_map.keys()):
+                print(f"⏩ Skipper {ep_name} (allerede ferdig)")
                 continue
 
-            print(f"\n🎧 Behandler: {ep_name}")
+            print(f"🎧 Behandler: {ep_name}")
             
-            # 1. Les JSONL og finn det lengste klippet per speaker
-            response = s3.get_object(Bucket=BUCKET, Key=jsonl_key)
-            content = response['Body'].read().decode('utf-8')
+            # Last data
+            jsonl_obj = s3.get_object(Bucket=BUCKET, Key=jsonl_key)
+            transcript_lines = jsonl_obj['Body'].read().decode('utf-8').splitlines()
             
-            speaker_clips = {}
-            for line in content.splitlines():
-                if line.strip():
-                    data = json.loads(line)
-                    spk = data['speaker']
-                    duration = data['end'] - data['start']
-                    
-                    if spk not in speaker_clips or duration > speaker_clips[spk]['duration']:
-                        speaker_clips[spk] = {'start': data['start'], 'end': data['end'], 'duration': duration}
-
-            if not speaker_clips: continue
-
-            # 2. Last ned lydfil midlertidig
-            temp_audio = "temp_audio.mp3"
+            audio_key = jsonl_key.replace("processed/", "raw/").replace(".jsonl", ".mp3")
             try:
-                s3.download_file(BUCKET, audio_key, temp_audio)
-            except Exception as e:
-                print(f"⚠️ Fant ikke lydfil for {audio_key}. Hopper over.")
+                audio_obj = s3.get_object(Bucket=BUCKET, Key=audio_key)
+                audio = AudioSegment.from_file(BytesIO(audio_obj['Body'].read()))
+            except:
+                print(f"⚠️ Fant ikke lydfil for {ep_name}")
                 continue
 
-            audio = AudioSegment.from_file(temp_audio)
+            # Samle alle klipp per speaker
+            speaker_segments = defaultdict(list)
+            for line in transcript_lines:
+                data = json.loads(line)
+                duration = data['end'] - data['start']
+                if duration > 1.5: # Ignorer veldig korte lyder
+                    speaker_segments[data['speaker']].append((data['start'], data['end'], duration))
 
-            # 3. Lag fingeravtrykk
-            for spk, times in speaker_clips.items():
-                start_ms = int(times['start'] * 1000)
-                end_ms = int(times['end'] * 1000)
-                clip = audio[start_ms:end_ms]
+            # Prosesser hver speaker
+            for speaker, segments in speaker_segments.items():
+                # Sorter etter lengde (lengst først) og ta de N beste
+                segments.sort(key=lambda x: x[2], reverse=True)
+                top_segments = segments[:NUM_SAMPLES]
                 
-                temp_clip = "temp_clip.wav"
-                clip.export(temp_clip, format="wav")
+                vectors = []
+                total_duration = 0
                 
-                unique_id = f"{ep_name}_{spk}"
-                embedding = inference(temp_clip)
-                all_embeddings[unique_id] = embedding
-                print(f"  👉 Hentet ut avtrykk for {spk} ({times['duration']:.1f} sek)")
+                for start, end, dur in top_segments:
+                    start_ms = int(start * 1000)
+                    end_ms = int(end * 1000)
+                    
+                    # Trekk ut lyden og konverter til formatet modellen liker
+                    chunk = audio[start_ms:end_ms].set_frame_rate(16000).set_channels(1)
+                    
+                    # Lagre midlertidig wav for inference (Pyannote krever filsti eller tensor)
+                    chunk.export("/tmp/clip.wav", format="wav")
+                    
+                    # Generer embedding
+                    with torch.no_grad():
+                        embedding = inference("/tmp/clip.wav")
+                        vectors.append(embedding)
+                        total_duration += dur
 
-            # Rydd opp midlertidige filer lokalt
-            if os.path.exists(temp_audio): os.remove(temp_audio)
-            if os.path.exists("temp_clip.wav"): os.remove("temp_clip.wav")
+                if vectors:
+                    # ✨ MAGIEN: Regn ut gjennomsnittet av alle vektorene
+                    mean_vector = np.mean(vectors, axis=0)
+                    
+                    # Lagre i kartet
+                    unique_id = f"{ep_name}_{speaker}"
+                    embeddings_map[unique_id] = mean_vector
+                    print(f"   👉 {speaker}: Snitt av {len(vectors)} klipp ({total_duration:.1f} sek)")
 
-            # --- LAGRE PROGRESS TIL S3 ---
-            s3.put_object(
-                Bucket=BUCKET, 
-                Key=EMBEDDINGS_KEY, 
-                Body=pickle.dumps(all_embeddings)
-            )
-
-    print(f"\n✅ Jobb A er ferdig! Fingeravtrykkene ligger trygt i S3: {EMBEDDINGS_KEY}")
+            # Lagre checkpoint til S3 etter hver episode
+            s3.put_object(Bucket=BUCKET, Key=f"{BASE_PATH}/embeddings.pkl", Body=pickle.dumps(embeddings_map))
 
 if __name__ == "__main__":
     main()
