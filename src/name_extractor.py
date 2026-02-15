@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import re
+import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -69,23 +71,55 @@ def read_jsonl_text(text: str) -> List[Dict[str, Any]]:
 
 
 def extract_first_json_object(s: str) -> str:
-    """Finner første { og siste } for å hente ut ren JSON fra rotete LLM-svar."""
-    # Rens markdown først
-    if "```" in s:
-        s = s.replace("```json", "").replace("```", "")
+    """
+    Robust ekstraksjon av JSON fra LLM-svar.
+    Håndterer markdown, tekst før/etter, og lister/objekter.
+    """
+    # 1. Fjern markdown code blocks
+    s = s.replace("```json", "").replace("```", "")
     
-    start = s.find("{")
-    end = s.rfind("}")
+    # 2. Finn første { eller [
+    start_obj = s.find("{")
+    start_list = s.find("[")
     
-    if start == -1 or end == -1 or end <= start:
-        # Fallback: Hvis den returnerte en liste []
-        start_list = s.find("[")
-        end_list = s.rfind("]")
-        if start_list != -1 and end_list != -1:
-             return s[start_list : end_list + 1]
-        raise ValueError("Fant ikke JSON-objekt i LLM-respons.")
+    # Hvis ingen finnes
+    if start_obj == -1 and start_list == -1:
+        raise ValueError("Fant ikke JSON-struktur (verken { eller [) i svar.")
+    
+    # 3. Bestem hva som kommer først
+    is_list = False
+    if start_obj == -1:
+        start = start_list
+        is_list = True
+    elif start_list == -1:
+        start = start_obj
+    else:
+        # Begge finnes, ta den første
+        if start_list < start_obj:
+            start = start_list
+            is_list = True
+        else:
+            start = start_obj
+
+    # 4. Finn matchende slutt-tegn
+    end_char = "]" if is_list else "}"
+    end = s.rfind(end_char)
+    
+    if end == -1 or end <= start:
+        raise ValueError(f"Fant start '{s[start]}', men ingen slutt '{end_char}'.")
         
     return s[start : end + 1]
+
+
+def normalize_line_id(line_id: str) -> str:
+    """Gjør om 'L1', 'L01' -> 'L0001' for sikker matching."""
+    line_id = line_id.strip()
+    # Matcher L fulgt av tall
+    m = re.fullmatch(r"[lL]?(\d{1,4})", line_id)
+    if m:
+        num = int(m.group(1))
+        return f"L{num:04d}"
+    return line_id
 
 
 def clamp01(x: float) -> float:
@@ -93,22 +127,17 @@ def clamp01(x: float) -> float:
 
 
 def is_plausible_person_name(name: str) -> bool:
-    # Tillat norske bokstaver, bindestrek og apostrof.
     n = name.strip()
-    if not n:
-        return False
-    # Fjern "@" etc
+    if not n: return False
+    # Fjern tegn som ikke hører hjemme i navn
     n2 = re.sub(r"[^a-zA-ZÆØÅæøå\-\s']", " ", n)
     n2 = re.sub(r"\s+", " ", n2).strip()
-    if not n2:
-        return False
+    if not n2: return False
 
     tokens = [t for t in n2.split(" ") if len(t) >= 2]
-    # Fullt navn er best (2 tokens), men la én-token slippe gjennom om den er lang nok.
-    if len(tokens) >= 2:
-        return True
-    if len(tokens) == 1 and len(tokens[0]) >= 4:
-        return True
+    # Minst to navn (Fornavn Etternavn) ELLER ett langt navn (minst 4 tegn)
+    if len(tokens) >= 2: return True
+    if len(tokens) == 1 and len(tokens[0]) >= 4: return True
     return False
 
 
@@ -150,10 +179,8 @@ class Config:
 
 def load_config() -> Config:
     load_dotenv()
-
     s3_bucket = env_str("S3_BUCKET")
-    if not s3_bucket:
-        raise ValueError("Mangler S3_BUCKET")
+    if not s3_bucket: raise ValueError("Mangler S3_BUCKET")
 
     return Config(
         s3_bucket=s3_bucket,
@@ -177,8 +204,7 @@ def load_config() -> Config:
 
 def get_s3_client(cfg: Config):
     kwargs: Dict[str, Any] = {}
-    if cfg.s3_endpoint:
-        kwargs["endpoint_url"] = cfg.s3_endpoint
+    if cfg.s3_endpoint: kwargs["endpoint_url"] = cfg.s3_endpoint
     if cfg.aws_access_key and cfg.aws_secret_key:
         kwargs["aws_access_key_id"] = cfg.aws_access_key
         kwargs["aws_secret_access_key"] = cfg.aws_secret_key
@@ -186,11 +212,11 @@ def get_s3_client(cfg: Config):
 
 
 # -----------------------------
-# LLM client (OpenAI-compatible)
+# LLM client (Robust Retry)
 # -----------------------------
 def llm_chat(cfg: Config, messages: List[Dict[str, str]]) -> str:
     if not cfg.llm_base_url or not cfg.llm_api_key:
-        raise ValueError("LLM_BASE_URL/LLM_API_KEY mangler (sett i .env).")
+        raise ValueError("LLM_BASE_URL/LLM_API_KEY mangler.")
 
     url = cfg.llm_base_url.rstrip("/") + "/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cfg.llm_api_key}"}
@@ -199,10 +225,33 @@ def llm_chat(cfg: Config, messages: List[Dict[str, str]]) -> str:
         "messages": messages,
         "temperature": cfg.temperature,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+
+    # Retry logic (viktig for prod)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            
+            # Hvis vi får 429 (Rate Limit) eller 5xx (Server Error), vent og prøv igjen
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < max_retries - 1:
+                    sleep_time = 2 ** attempt # 1s, 2s, 4s...
+                    print(f"⚠️ LLM Error {resp.status_code}, prøver igjen om {sleep_time}s...")
+                    time.sleep(sleep_time)
+                    continue
+            
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+            
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Network error: {e}, prøver igjen...")
+                time.sleep(2)
+                continue
+            raise e # Gi opp etter siste forsøk
+
+    raise Exception("Max retries exceeded")
 
 
 # -----------------------------
@@ -218,25 +267,21 @@ def episode_speaker_durations(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     d: Dict[str, float] = {}
     for r in rows:
         gid = r.get("global_speaker_id")
-        if not gid:
-            continue
+        if not gid: continue
         try:
             st = float(r.get("start", 0.0))
             en = float(r.get("end", 0.0))
             dur = max(0.0, en - st)
-        except Exception:
-            continue
+        except Exception: continue
         d[str(gid)] = d.get(str(gid), 0.0) + dur
     return d
 
 
 def dominant_speaker(rows: List[Dict[str, Any]], dominant_frac: float) -> Tuple[Optional[str], float]:
     d = episode_speaker_durations(rows)
-    if not d:
-        return None, 0.0
+    if not d: return None, 0.0
     total = sum(d.values())
-    if total <= 1e-6:
-        return None, 0.0
+    if total <= 1e-6: return None, 0.0
     gid = max(d, key=lambda k: d[k])
     frac = d[gid] / total
     if frac >= dominant_frac:
@@ -245,58 +290,44 @@ def dominant_speaker(rows: List[Dict[str, Any]], dominant_frac: float) -> Tuple[
 
 
 def build_lines_with_ids(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, Dict[str, Dict[str, Any]]]:
-    """
-    Lager tekst til LLM med line-id som vi kan validere hardt mot.
-    Returnerer:
-      - snippet
-      - line_index: { "L0001": {"gid":..., "start":..., "end":..., "text":...} }
-    """
-    # 1) Startlinjer 
+    # 1) Startlinjer
     first = rows[: cfg.max_episode_lines]
 
-    # 2) Intro-jakt med KONTEKST
+    # 2) Intro-jakt med kontekst
     intro: List[Dict[str, Any]] = []
     for i, r in enumerate(rows):
         txt = str(r.get("text", "")).strip()
         if txt and INTRO_PAT.search(txt):
-            # Fant et nøkkelord! Legg til denne linjen...
             intro.append(r)
-            # ...OG de 2 neste linjene (for å fange opp svaret/turn-taking)
-            if i + 1 < len(rows):
-                intro.append(rows[i+1])
-            if i + 2 < len(rows):
-                intro.append(rows[i+2])
+            # Ta med de 2 neste for kontekst (svar)
+            if i + 1 < len(rows): intro.append(rows[i+1])
+            if i + 2 < len(rows): intro.append(rows[i+2])
         
         if len(intro) >= cfg.max_episode_lines:
             break
 
-    # 3) per speaker: første M linjer
+    # 3) Per speaker
     per: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         gid = r.get("global_speaker_id")
-        if not gid:
-            continue
+        if not gid: continue
         gid = str(gid)
         per.setdefault(gid, [])
         if len(per[gid]) < cfg.max_speaker_lines:
             per[gid].append(r)
 
-    # slå sammen (dedup på (start,end,gid,text))
     merged: List[Dict[str, Any]] = []
     seen = set()
-    def add_many(items: List[Dict[str, Any]]):
+    def add_many(items):
         for r in items:
-            k = (r.get("start"), r.get("end"), r.get("global_speaker_id"), r.get("text"))
-            if k in seen:
-                continue
+            k = (r.get("start"), r.get("text")) # Dedup key
+            if k in seen: continue
             seen.add(k)
             merged.append(r)
 
     add_many(first)
     add_many(intro)
-    
     for gid, items in per.items():
-        # Sorter speaker-linjene på tid før vi kutter dem
         sorted_items = sorted(items, key=lambda x: float(x.get("start", 0.0)))
         add_many(sorted_items[: cfg.max_speaker_lines])
 
@@ -318,19 +349,15 @@ def build_lines_with_ids(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, 
 
 
 # -----------------------------
-# Validation (anti-hallusinasjon + anti-Gunvor/Torstein)
+# Validation
 # -----------------------------
 def speaker_speaks_soon_after(rows: List[Dict[str, Any]], gid: str, t: float, window_s: float) -> bool:
     t1 = t + window_s
     for r in rows:
-        if str(r.get("global_speaker_id")) != gid:
-            continue
-        try:
-            st = float(r.get("start", 0.0))
-        except Exception:
-            continue
-        if st >= t and st <= t1:
-            return True
+        if str(r.get("global_speaker_id")) != gid: continue
+        try: st = float(r.get("start", 0.0))
+        except: continue
+        if st >= t and st <= t1: return True
     return False
 
 
@@ -344,7 +371,10 @@ def validate_assignment(
     gid = str(a.get("global_speaker_id", "")).strip()
     name = str(a.get("name", "")).strip()
     ev = a.get("evidence", {}) or {}
-    line_id = str(ev.get("line_id", "")).strip()
+    
+    # 1. Normaliser line_id for å unngå mismatch (L1 vs L0001)
+    raw_line_id = str(ev.get("line_id", "")).strip()
+    line_id = normalize_line_id(raw_line_id)
     ev_type = str(ev.get("type", "")).strip().lower()
 
     if not gid or not name or not line_id:
@@ -355,43 +385,39 @@ def validate_assignment(
 
     li = line_index.get(line_id)
     if not li:
-        return False, "line_id_not_found"
+        return False, f"line_id_not_found_raw_{raw_line_id}"
 
     line_gid = str(li["gid"])
     line_text = str(li["text"])
 
-    # quote må finnes i teksten på den linjen
     quote = str(ev.get("quote", "")).strip()
     if not quote or quote not in line_text:
         return False, "quote_not_in_line_text"
 
-    # navn bør også finnes på linjen (case-insensitive) – ellers er det ofte hallus
     if name.lower() not in line_text.lower():
         return False, "name_not_in_evidence_line"
 
     if ev_type not in {"self_intro", "host_intro"}:
         return False, "bad_evidence_type"
 
-    # Sterke regler:
+    # --- Regler ---
+    
+    # Self Intro
     if ev_type == "self_intro":
-        # Self intro må være samme speaker som subject
         if gid != line_gid:
             return False, "self_intro_gid_mismatch"
-        # Self intro bør inneholde "jeg heter"/"mitt navn"
         if not re.search(r"\b(jeg heter|mitt navn)\b", line_text, re.IGNORECASE):
             return False, "self_intro_missing_phrase"
         return True, "ok"
 
-    # host_intro
-    # Host intro skal normalt være sagt av en annen speaker enn subject.
+    # Host Intro
     if gid == line_gid:
         return False, "host_intro_same_speaker"
 
-    # aldri gi host_intro-navn til dominant speaker (Gunvor/Torstein-sperre)
-    if dominant_gid and gid == dominant_gid:
-        return False, "host_intro_targets_dominant"
+    # OBS: Vi har fjernet "host_intro_targets_dominant" regelen her!
+    # Gjesten KAN være dominant speaker i et intervju.
+    # Vi stoler på "host_intro_same_speaker" og "speaker_speaks_soon_after" i stedet.
 
-    # subject må faktisk snakke kort tid etter introen (turn-taking)
     t_after = float(li["end"])
     if not speaker_speaks_soon_after(rows, gid, t_after, cfg.after_intro_window_s):
         return False, "subject_not_speaking_soon_after_intro"
@@ -400,42 +426,30 @@ def validate_assignment(
 
 
 # -----------------------------
-# LLM extraction
+# LLM Logic
 # -----------------------------
 def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dict[str, Any]:
-    # --- ENDRET: Bruker nå generelle "Ola Nordmann"-eksempler for å unngå data-lekkasje ---
+    # Generisk, robust prompt som tvinger logisk tenkning
     system = (
-        "Du er en ekspert på å trekke ut PERSONNAVN fra transkripsjoner.\n"
-        "Din ENESTE oppgave er å finne ut hva folk heter basert på introduksjoner.\n\n"
+        "Du analyserer transkripsjoner for å finne personnavn.\n"
+        "Bruk logisk deduksjon. Koble introduksjoner til riktig Speaker ID.\n\n"
         
-        "REGLER FOR LOGIKK:\n"
-        "1. IKKE bruk navn som 'Host' eller 'Guest'. Vi trenger EKTE navn.\n"
-        "2. HVIS Speaker A sier: 'Velkommen Kari', SÅ er Speaker A = Verten, og Speaker B (den som svarer eller snakker etterpå) = Kari.\n"
-        "   - VIKTIG: Du må koble navnet 'Kari' til Speaker B sin ID, IKKE Speaker A sin ID.\n"
-        "3. Ignorer generelle navn som 'dere', 'alle sammen', 'gjestene'.\n\n"
+        "VIKTIGSTE REGEL:\n"
+        "Hvis Speaker A sier 'Velkommen, [NAVN]', så er det NESTE NYE speaker (Speaker B) som heter [NAVN].\n"
+        "Aldri gi navnet til Speaker A (den som introduserer).\n\n"
 
-        "EKSEMPEL 1 (Vert introduserer gjest):\n"
+        "EKSEMPLER (Formatet er L0000):\n"
         "Input:\n"
-        "L01|spk_host|Velkommen til deg, Ola Nordmann.\n"
-        "L02|spk_host|Du har jobbet med dette lenge.\n"
-        "L03|spk_guest|Ja, det stemmer.\n"
+        "L0001|spk_A|Hei og velkommen, Per Hansen.\n"
+        "L0002|spk_A|Hyggelig å se deg.\n"
+        "L0003|spk_B|Takk for det.\n"
         "Output JSON:\n"
         "{\n"
         '  "assignments": [\n'
-        '    { "global_speaker_id": "spk_guest", "name": "Ola Nordmann", "confidence": 0.95, "evidence": { "type": "host_intro", "line_id": "L01", "quote": "Velkommen til deg, Ola Nordmann" } }\n'
+        '    { "global_speaker_id": "spk_B", "name": "Per Hansen", "confidence": 0.95, "evidence": { "type": "host_intro", "line_id": "L0001", "quote": "velkommen, Per Hansen" } }\n'
         '  ]\n'
         "}\n\n"
         
-        "EKSEMPEL 2 (Selv-intro):\n"
-        "Input:\n"
-        "L05|spk_new|Hei, jeg heter Kari Hansen.\n"
-        "Output JSON:\n"
-        "{\n"
-        '  "assignments": [\n'
-        '    { "global_speaker_id": "spk_new", "name": "Kari Hansen", "confidence": 1.0, "evidence": { "type": "self_intro", "line_id": "L05", "quote": "jeg heter Kari Hansen" } }\n'
-        '  ]\n'
-        "}\n\n"
-
         "Svar KUN med gyldig JSON."
     )
 
@@ -443,35 +457,33 @@ def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dic
         f"EPISODE: {audio_file}\n\n"
         "TRANSKRIPSJON:\n"
         f"{snippet}\n\n"
-        "Finn navnene nå. Husk: Koble navnet til den personen som BLIR INTRODUSERT, ikke den som snakker."
+        "Finn assignments nå."
     )
 
     try:
         content = llm_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}])
         
-        # Rens markdown
-        cleaned_content = content.strip()
-        if "```" in cleaned_content:
-            start = cleaned_content.find("{")
-            end = cleaned_content.rfind("}")
-            if start != -1 and end != -1:
-                cleaned_content = cleaned_content[start:end+1]
-
-        obj = json.loads(cleaned_content)
+        # Robust parsing (håndterer både objekt og liste)
+        json_str = extract_first_json_object(content)
+        parsed = json.loads(json_str)
         
+        # Normaliser strukturen
+        if isinstance(parsed, list):
+            obj = {"assignments": parsed, "unknown": []}
+        else:
+            obj = parsed
+
     except Exception as e:
-        print(f"⚠️  LLM JSON Error i {audio_file}: {e}")
+        print(f"⚠️  LLM Error i {audio_file}: {e}")
         return {"assignments": [], "unknown": []}
 
-    if "assignments" not in obj:
-        obj["assignments"] = []
-    if "unknown" not in obj:
-        obj["unknown"] = []
+    if "assignments" not in obj: obj["assignments"] = []
+    if "unknown" not in obj: obj["unknown"] = []
     return obj
 
 
 def process_one_episode(s3, cfg: Config, key: str) -> None:
-    relative = key.replace(cfg.s3_processed_global_prefix, "", 1)  # podcast/episode.jsonl
+    relative = key.replace(cfg.s3_processed_global_prefix, "", 1)
     cache_key = f"{cfg.s3_global_prefix}name_cache/{relative[:-5]}.json"
 
     if s3_exists(s3, cfg.s3_bucket, cache_key):
@@ -486,10 +498,8 @@ def process_one_episode(s3, cfg: Config, key: str) -> None:
         return
 
     audio_file = str(rows[0].get("audio_file", "")).strip()
-
     snippet, line_index = build_lines_with_ids(rows, cfg)
     dom_gid, dom_frac = dominant_speaker(rows, cfg.dominant_episode_frac)
-
     llm_res = resolve_names_for_episode(cfg, audio_file, snippet)
 
     valid: List[Dict[str, Any]] = []
@@ -500,20 +510,15 @@ def process_one_episode(s3, cfg: Config, key: str) -> None:
         conf = clamp01(float(a.get("confidence", 0.0)))
         a["confidence"] = conf
         a["_validation"] = {"ok": ok, "reason": reason}
-        if ok:
-            valid.append(a)
-        else:
-            rejected.append(a)
+        if ok: valid.append(a)
+        else: rejected.append(a)
 
     out = {
         "episode_key": key,
         "audio_file": audio_file,
-        "podcast": audio_file.split("/")[0] if "/" in audio_file else None,
         "dominant_gid": dom_gid,
-        "dominant_frac": dom_frac,
         "valid_assignments": valid,
         "rejected_assignments": rejected,
-        "unknown": llm_res.get("unknown", []),
     }
 
     tmp = cfg.local_temp_dir / "name_cache" / f"{relative[:-5]}.json"
@@ -521,12 +526,18 @@ def process_one_episode(s3, cfg: Config, key: str) -> None:
     tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     s3.upload_file(str(tmp), cfg.s3_bucket, cache_key)
 
-    print(f"OK: {relative} valid={len(valid)} rejected={len(rejected)} dom={dom_gid}({dom_frac:.2f})")
+    # Logging av rejects for debugging
+    log_msg = f"OK: {relative} valid={len(valid)} rejected={len(rejected)} dom={dom_gid}({dom_frac:.2f})"
+    if rejected:
+        reasons = Counter([r["_validation"]["reason"] for r in rejected])
+        top_reason = reasons.most_common(1)[0]
+        log_msg += f" | Top Reject: {top_reason[0]} ({top_reason[1]}x)"
+    print(log_msg)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fase 1: Ekstraher navnebevis per episode til S3 cache.")
-    parser.add_argument("--max-files", type=int, default=0, help="Begrens antall episoder (0=ingen grense).")
+    parser = argparse.ArgumentParser(description="Ekstraher navn til S3.")
+    parser.add_argument("--max-files", type=int, default=0)
     args = parser.parse_args()
 
     cfg = load_config()
@@ -536,8 +547,7 @@ def main() -> None:
     keys = list_s3_keys(s3, cfg.s3_bucket, cfg.s3_processed_global_prefix, suffix=".jsonl")
     keys.sort()
 
-    if args.max_files and args.max_files > 0:
-        keys = keys[: args.max_files]
+    if args.max_files > 0: keys = keys[: args.max_files]
 
     for i, k in enumerate(keys, start=1):
         print(f"[{i}/{len(keys)}] {k}")
