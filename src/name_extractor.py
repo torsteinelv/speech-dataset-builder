@@ -251,15 +251,22 @@ def build_lines_with_ids(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, 
       - snippet
       - line_index: { "L0001": {"gid":..., "start":..., "end":..., "text":...} }
     """
-    # 1) startlinjer
+    # 1) Startlinjer 
     first = rows[: cfg.max_episode_lines]
 
-    # 2) intro-linjer (fra hele episoden, begrenset)
+    # 2) Intro-jakt med KONTEKST
     intro: List[Dict[str, Any]] = []
-    for r in rows:
+    for i, r in enumerate(rows):
         txt = str(r.get("text", "")).strip()
         if txt and INTRO_PAT.search(txt):
+            # Fant et nøkkelord! Legg til denne linjen...
             intro.append(r)
+            # ...OG de 2 neste linjene (for å fange opp svaret/turn-taking)
+            if i + 1 < len(rows):
+                intro.append(rows[i+1])
+            if i + 2 < len(rows):
+                intro.append(rows[i+2])
+        
         if len(intro) >= cfg.max_episode_lines:
             break
 
@@ -287,9 +294,11 @@ def build_lines_with_ids(rows: List[Dict[str, Any]], cfg: Config) -> Tuple[str, 
 
     add_many(first)
     add_many(intro)
-    # ta litt per speaker, men ikke eksploder
+    
     for gid, items in per.items():
-        add_many(sorted(items, key=lambda x: float(x.get("start", 0.0)))[: cfg.max_speaker_lines])
+        # Sorter speaker-linjene på tid før vi kutter dem
+        sorted_items = sorted(items, key=lambda x: float(x.get("start", 0.0)))
+        add_many(sorted_items[: cfg.max_speaker_lines])
 
     merged.sort(key=lambda x: float(x.get("start", 0.0)))
 
@@ -394,35 +403,36 @@ def validate_assignment(
 # LLM extraction
 # -----------------------------
 def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dict[str, Any]:
+    # --- ENDRET: Bruker nå generelle "Ola Nordmann"-eksempler for å unngå data-lekkasje ---
     system = (
         "Du er en ekspert på å trekke ut PERSONNAVN fra transkripsjoner.\n"
         "Din ENESTE oppgave er å finne ut hva folk heter basert på introduksjoner.\n\n"
         
         "REGLER FOR LOGIKK:\n"
-        "1. IKKE bruk navn som 'Host' eller 'Guest'. Vi trenger EKTE navn (f.eks 'Torstein', 'Eirik').\n"
-        "2. HVIS Speaker A sier: 'Velkommen Eirik', SÅ er Speaker A = Verten, og Speaker B (den som svarer eller snakker etterpå) = Eirik.\n"
-        "   - VIKTIG: Du må koble navnet 'Eirik' til Speaker B sin ID, IKKE Speaker A sin ID.\n"
+        "1. IKKE bruk navn som 'Host' eller 'Guest'. Vi trenger EKTE navn.\n"
+        "2. HVIS Speaker A sier: 'Velkommen Kari', SÅ er Speaker A = Verten, og Speaker B (den som svarer eller snakker etterpå) = Kari.\n"
+        "   - VIKTIG: Du må koble navnet 'Kari' til Speaker B sin ID, IKKE Speaker A sin ID.\n"
         "3. Ignorer generelle navn som 'dere', 'alle sammen', 'gjestene'.\n\n"
 
         "EKSEMPEL 1 (Vert introduserer gjest):\n"
         "Input:\n"
-        "L01|spk_host|Velkommen til deg, Eirik Kristensen.\n"
-        "L02|spk_host|Du har jobbet med jazz lenge.\n"
+        "L01|spk_host|Velkommen til deg, Ola Nordmann.\n"
+        "L02|spk_host|Du har jobbet med dette lenge.\n"
         "L03|spk_guest|Ja, det stemmer.\n"
         "Output JSON:\n"
         "{\n"
         '  "assignments": [\n'
-        '    { "global_speaker_id": "spk_guest", "name": "Eirik Kristensen", "confidence": 0.95, "evidence": { "type": "host_intro", "line_id": "L01", "quote": "Velkommen til deg, Eirik Kristensen" } }\n'
+        '    { "global_speaker_id": "spk_guest", "name": "Ola Nordmann", "confidence": 0.95, "evidence": { "type": "host_intro", "line_id": "L01", "quote": "Velkommen til deg, Ola Nordmann" } }\n'
         '  ]\n'
         "}\n\n"
         
         "EKSEMPEL 2 (Selv-intro):\n"
         "Input:\n"
-        "L05|spk_new|Hei, jeg heter Kari Nordmann.\n"
+        "L05|spk_new|Hei, jeg heter Kari Hansen.\n"
         "Output JSON:\n"
         "{\n"
         '  "assignments": [\n'
-        '    { "global_speaker_id": "spk_new", "name": "Kari Nordmann", "confidence": 1.0, "evidence": { "type": "self_intro", "line_id": "L05", "quote": "jeg heter Kari Nordmann" } }\n'
+        '    { "global_speaker_id": "spk_new", "name": "Kari Hansen", "confidence": 1.0, "evidence": { "type": "self_intro", "line_id": "L05", "quote": "jeg heter Kari Hansen" } }\n'
         '  ]\n'
         "}\n\n"
 
