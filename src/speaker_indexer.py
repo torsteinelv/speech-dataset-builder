@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,20 +15,34 @@ import torch
 from dotenv import load_dotenv
 
 # --- MONKEY PATCH START (Må være før pyannote imports) ---
-# Dette fikser "TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'"
+# Fikser "TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'"
+import inspect
 import huggingface_hub
+from huggingface_hub import file_download
 
-# Vi tar vare på den originale funksjonen
 _original_hf_hub_download = huggingface_hub.hf_hub_download
 
+
 def _patched_hf_hub_download(*args, **kwargs):
-    # Hvis gamle biblioteker sender 'use_auth_token', bytter vi navn til 'token'
+    # Map legacy kw -> new kw uten å overskrive token hvis den allerede finnes
     if "use_auth_token" in kwargs:
-        kwargs["token"] = kwargs.pop("use_auth_token")
+        if "token" not in kwargs:
+            kwargs["token"] = kwargs["use_auth_token"]
+        kwargs.pop("use_auth_token", None)
     return _original_hf_hub_download(*args, **kwargs)
 
-# Vi erstatter funksjonen i biblioteket med vår fikset versjon
-huggingface_hub.hf_hub_download = _patched_hf_hub_download
+
+# Patch kun hvis hf_hub_download ikke støtter use_auth_token
+try:
+    params = set(inspect.signature(_original_hf_hub_download).parameters)
+    if "use_auth_token" not in params:
+        huggingface_hub.hf_hub_download = _patched_hf_hub_download
+        file_download.hf_hub_download = _patched_hf_hub_download
+except Exception:
+    # Hvis signature-inspection feiler, patch likevel (trygt)
+    huggingface_hub.hf_hub_download = _patched_hf_hub_download
+    file_download.hf_hub_download = _patched_hf_hub_download
+
 # --- MONKEY PATCH SLUTT ---
 
 from pyannote.audio import Model, Inference
@@ -50,6 +65,20 @@ def env_int(name: str, default: int) -> int:
 def env_str(name: str, default: str) -> str:
     v = os.getenv(name)
     return v.strip() if v is not None and v.strip() else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or not v.strip():
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
 def normalize(v: np.ndarray) -> np.ndarray:
@@ -104,6 +133,24 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write("\n")
 
 
+def looks_like_html_or_text_error(p: Path) -> bool:
+    """
+    Enkel guard mot at "mp3" egentlig er HTML/tekst.
+    """
+    try:
+        if not p.exists() or not p.is_file():
+            return True
+        if p.stat().st_size < 1024:
+            return True
+        head = p.open("rb").read(256).lower()
+        # HTML / typiske feil-tekster
+        if b"<!doctype" in head or b"<html" in head or b"access denied" in head:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -133,6 +180,12 @@ class Config:
     max_segments: int
     min_segment_s: float
     embed_window_s: float
+
+    # decode robustness
+    convert_to_wav: bool
+    wav_sample_rate: int
+    wav_channels: int
+    keep_wav_cache: bool
 
     local_temp_dir: Path
 
@@ -164,6 +217,9 @@ def load_config() -> Config:
     if not s3_bucket:
         raise ValueError("Mangler S3_BUCKET")
 
+    # Viktig: gjør local_temp_dir til absolutt path for å unngå cwd-problemer
+    local_temp_dir = Path(env_str("LOCAL_TEMP_DIR", "temp_global_index")).resolve()
+
     return Config(
         s3_bucket=s3_bucket,
         s3_endpoint=os.getenv("S3_ENDPOINT_URL"),
@@ -174,7 +230,7 @@ def load_config() -> Config:
         processed_global_prefix=env_str("PROCESSED_GLOBAL_PREFIX", "processed_global"),
         global_prefix=env_str("GLOBAL_PREFIX", "global"),
         embedding_model=env_str("SPEAKER_EMBEDDING_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM"),
-        embedding_device=env_str("SPEAKER_EMBEDDING_DEVICE", "cuda"),
+        embedding_device=env_str("SPEAKER_EMBEDDING_DEVICE", "cpu"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"),
         sim_high=env_float("GLOBAL_SIM_HIGH", 0.78),
         sim_low=env_float("GLOBAL_SIM_LOW", 0.68),
@@ -183,7 +239,11 @@ def load_config() -> Config:
         max_segments=env_int("GLOBAL_MAX_SEGMENTS", 12),
         min_segment_s=env_float("GLOBAL_MIN_SEGMENT_SECONDS", 1.6),
         embed_window_s=env_float("GLOBAL_EMBED_WINDOW_SECONDS", 3.0),
-        local_temp_dir=Path(env_str("LOCAL_TEMP_DIR", "temp_global_index")),
+        convert_to_wav=env_bool("GLOBAL_CONVERT_TO_WAV", True),
+        wav_sample_rate=env_int("GLOBAL_WAV_SAMPLE_RATE", 16000),
+        wav_channels=env_int("GLOBAL_WAV_CHANNELS", 1),
+        keep_wav_cache=env_bool("GLOBAL_KEEP_WAV_CACHE", False),
+        local_temp_dir=local_temp_dir,
     )
 
 
@@ -198,21 +258,102 @@ def get_s3_client(cfg: Config):
 
 
 # -----------------------------
+# Audio decode helpers
+# -----------------------------
+def convert_to_wav(cfg: Config, src_audio: Path, audio_rel: str) -> Optional[Path]:
+    """
+    Konverter input-audio (mp3/m4a/aac/whatever) til stabil WAV for embedding.
+    Dette løser mpg123/ID3/junk-header issues og mismatch mellom "mp3" og faktisk format.
+
+    Returnerer wav-path hvis ok, ellers None.
+    """
+    if not src_audio.exists() or not src_audio.is_file():
+        return None
+
+    # HTML/feilside guard
+    if looks_like_html_or_text_error(src_audio):
+        return None
+
+    wav_path = (cfg.local_temp_dir / "wav_cache" / Path(audio_rel)).with_suffix(".wav")
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Cache-hit
+    if wav_path.exists():
+        try:
+            if wav_path.stat().st_size > 10_000:
+                return wav_path.resolve()
+        except Exception:
+            pass
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(src_audio.resolve()),
+        "-vn",
+        "-ac",
+        str(int(cfg.wav_channels)),
+        "-ar",
+        str(int(cfg.wav_sample_rate)),
+        str(wav_path.resolve()),
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        print("ADVARSEL: ffmpeg finnes ikke i image/container. Kan ikke konvertere til wav.")
+        return None
+    except subprocess.CalledProcessError as e:
+        err = ""
+        try:
+            err = e.stderr.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"ADVARSEL: ffmpeg-konvertering feilet for {audio_rel}: {err}")
+        return None
+    except Exception as e:
+        print(f"ADVARSEL: ffmpeg-konvertering feilet for {audio_rel}: {e}")
+        return None
+
+    if not wav_path.exists():
+        return None
+    try:
+        if wav_path.stat().st_size < 10_000:
+            return None
+    except Exception:
+        return None
+
+    return wav_path.resolve()
+
+
+# -----------------------------
 # Speaker embedding
 # -----------------------------
 class SpeakerEmbedder:
     """
     Bruker pyannote Model + Inference (window="whole") og inference.crop(...) for excerpt embeddings.
-    Ref: model card for pyannote/wespeaker-voxceleb-resnet34-LM. (Basic/Advanced usage)
+    Ref: model card for pyannote/wespeaker-voxceleb-resnet34-LM.
     """
 
     def __init__(self, model_id: str, device: str, hf_token: Optional[str] = None):
         kwargs: Dict[str, Any] = {}
-        # Mange modeller er åpne uten token, men støtt token hvis satt.
         if hf_token:
-            kwargs["token"] = hf_token
+            # robust på tvers av pyannote-versjoner
+            try:
+                sig = inspect.signature(Model.from_pretrained)
+                if "token" in sig.parameters:
+                    kwargs["token"] = hf_token
+                elif "use_auth_token" in sig.parameters:
+                    kwargs["use_auth_token"] = hf_token
+                else:
+                    kwargs["token"] = hf_token
+            except Exception:
+                kwargs["token"] = hf_token
 
-        # Her vil monkey-patchen over fikse kallet hvis pyannote bruker use_auth_token internt
         self.model = Model.from_pretrained(model_id, **kwargs)
         self.inference = Inference(self.model, window="whole")
         self.inference.to(torch.device(device))
@@ -234,7 +375,6 @@ def load_registry(s3, cfg: Config) -> List[Dict[str, Any]]:
     tmp.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(cfg.s3_bucket, cfg.s3_global_registry_key, str(tmp))
     rows = read_jsonl(tmp)
-    # sørg for korrekt typing/normalisering (defensivt)
     for r in rows:
         r["embedding"] = normalize(np.asarray(r["embedding"], dtype=np.float32)).tolist()
         r["n_examples"] = int(r.get("n_examples", 0))
@@ -251,8 +391,8 @@ def save_registry(s3, cfg: Config, registry: List[Dict[str, Any]]) -> None:
 def best_match(centroid: np.ndarray, registry: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], float]:
     if not registry:
         return None, float("-inf")
-    mat = np.stack([np.asarray(r["embedding"], dtype=np.float32) for r in registry], axis=0)  # (N, D)
-    sims = mat @ centroid  # cosine hvis begge er L2-normalisert
+    mat = np.stack([np.asarray(r["embedding"], dtype=np.float32) for r in registry], axis=0)
+    sims = mat @ centroid
     idx = int(np.argmax(sims))
     return registry[idx], float(sims[idx])
 
@@ -328,10 +468,7 @@ def group_by_local_speaker(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
 def local_speaker_stats(segments: List[Dict[str, Any]]) -> float:
     total = 0.0
     for s in segments:
-        try:
-            total += max(0.0, float(s["end"]) - float(s["start"]))
-        except Exception:
-            pass
+        total += max(0.0, safe_float(s.get("end", 0.0)) - safe_float(s.get("start", 0.0)))
     return total
 
 
@@ -346,17 +483,19 @@ def process_one_episode(
     registry: List[Dict[str, Any]],
     processed_key: str,
 ) -> None:
-    relative = processed_key.replace(cfg.s3_processed_prefix, "", 1)  # podcast/episode.jsonl
+    relative = processed_key.replace(cfg.s3_processed_prefix, "", 1)
     out_processed_key = f"{cfg.s3_processed_global_prefix}{relative}"
-    link_key = f"{cfg.s3_global_prefix}links/{relative[:-5]}.json"  # drop ".jsonl" -> ".json"
+    link_key = f"{cfg.s3_global_prefix}links/{relative[:-5]}.json"
 
     if s3_exists(s3, cfg.s3_bucket, out_processed_key) and s3_exists(s3, cfg.s3_bucket, link_key):
         print(f"SKIP (global ferdig): {relative}")
         return
 
     cfg.local_temp_dir.mkdir(parents=True, exist_ok=True)
-    local_processed = cfg.local_temp_dir / "processed" / relative
+
+    local_processed = (cfg.local_temp_dir / "processed" / relative).resolve()
     local_processed.parent.mkdir(parents=True, exist_ok=True)
+
     s3.download_file(cfg.s3_bucket, processed_key, str(local_processed))
     rows = read_jsonl(local_processed)
     if not rows:
@@ -369,18 +508,84 @@ def process_one_episode(
         return
 
     raw_key = f"{cfg.s3_raw_prefix}{audio_rel}"
-    local_mp3 = cfg.local_temp_dir / "raw" / audio_rel
-    local_mp3.parent.mkdir(parents=True, exist_ok=True)
-    if not local_mp3.exists():
-        s3.download_file(cfg.s3_bucket, raw_key, str(local_mp3))
+    local_audio = (cfg.local_temp_dir / "raw" / audio_rel).resolve()
+    local_audio.parent.mkdir(parents=True, exist_ok=True)
+
+    audio_ok = True
+    if not local_audio.exists():
+        try:
+            s3.download_file(cfg.s3_bucket, raw_key, str(local_audio))
+        except Exception as e:
+            print(f"ADVARSEL: kunne ikke laste ned raw audio fra s3://{cfg.s3_bucket}/{raw_key}: {e}")
+            audio_ok = False
+
+    # Basic sanity checks
+    if audio_ok:
+        try:
+            if (not local_audio.exists()) or (not local_audio.is_file()) or local_audio.stat().st_size < 1024:
+                audio_ok = False
+        except Exception:
+            pass
+
+    # Hvis vi kan: konverter til WAV for robust embedding (løser mpg123/junk header)
+    wav_path: Optional[Path] = None
+    audio_for_embedding: Optional[Path] = None
+    if audio_ok and cfg.convert_to_wav:
+        wav_path = convert_to_wav(cfg, local_audio, audio_rel)
+        if wav_path is not None:
+            audio_for_embedding = wav_path
+        else:
+            audio_for_embedding = local_audio
+    elif audio_ok:
+        audio_for_embedding = local_audio
+
+    if audio_for_embedding is None:
+        audio_ok = False
 
     groups = group_by_local_speaker(rows)
 
     link_result: Dict[str, Any] = {
         "audio_file": audio_rel,
         "processed_key": processed_key,
+        "raw_key": raw_key,
+        "audio_local_path": str(local_audio),
+        "audio_for_embedding": str(audio_for_embedding) if audio_for_embedding else None,
         "links": [],
     }
+
+    # Hvis audio ikke er tilgjengelig/lesbar: skriv link-result med skip for alle speakers
+    if not audio_ok:
+        for local_spk, segs in groups.items():
+            link_result["links"].append(
+                {
+                    "local_speaker": local_spk,
+                    "global_speaker_id": None,
+                    "decision": "audio_missing_or_invalid",
+                    "similarity": None,
+                    "total_speech_s": round(local_speaker_stats(segs), 3),
+                }
+            )
+
+        mapping: Dict[str, str] = {}
+        out_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            rr = dict(r)
+            rr["global_speaker_id"] = None
+            out_rows.append(rr)
+
+        local_out = (cfg.local_temp_dir / "processed_global" / relative).resolve()
+        write_jsonl(local_out, out_rows)
+        s3.upload_file(str(local_out), cfg.s3_bucket, out_processed_key)
+
+        local_link = (cfg.local_temp_dir / "links" / f"{relative[:-5]}.json").resolve()
+        local_link.parent.mkdir(parents=True, exist_ok=True)
+        local_link.write_text(json.dumps(link_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        s3.upload_file(str(local_link), cfg.s3_bucket, link_key)
+
+        print(f"ADVARSEL: {relative} -> audio mangler/ugyldig, skrev global output uten embeddings.")
+        return
+
+    audio_path = str(audio_for_embedding.resolve())
 
     for local_spk, segs in groups.items():
         if local_spk.lower() == "unknown":
@@ -431,11 +636,14 @@ def process_one_episode(
         weights: List[float] = []
         for st, en, w in windows:
             try:
-                v = embedder.embed_excerpt(str(local_mp3), st, en)
+                v = embedder.embed_excerpt(audio_path, st, en)
                 embs.append(v)
                 weights.append(float(w))
             except Exception as e:
-                print(f"ADVARSEL: embedding feilet local={local_spk} [{st:.2f},{en:.2f}] {e}")
+                print(
+                    f"ADVARSEL: embedding feilet local={local_spk} [{st:.2f},{en:.2f}] "
+                    f"audio={audio_path} err={e}"
+                )
 
         if not embs:
             link_result["links"].append(
@@ -472,7 +680,6 @@ def process_one_episode(
                     "updated_at": None,
                 }
             )
-
         else:
             candidate_id = str(best["global_speaker_id"])
             candidate_sim = float(sim)
@@ -503,8 +710,8 @@ def process_one_episode(
                         "updated_at": None,
                     }
                 )
-
             else:
+                # review: vi lager ny speaker for safety, men logger kandidat
                 decision = "review"
                 assigned_id = make_global_id()
                 registry.append(
@@ -543,14 +750,21 @@ def process_one_episode(
         rr["global_speaker_id"] = mapping.get(str(r.get("speaker", "")))
         out_rows.append(rr)
 
-    local_out = cfg.local_temp_dir / "processed_global" / relative
+    local_out = (cfg.local_temp_dir / "processed_global" / relative).resolve()
     write_jsonl(local_out, out_rows)
     s3.upload_file(str(local_out), cfg.s3_bucket, out_processed_key)
 
-    local_link = cfg.local_temp_dir / "links" / f"{relative[:-5]}.json"
+    local_link = (cfg.local_temp_dir / "links" / f"{relative[:-5]}.json").resolve()
     local_link.parent.mkdir(parents=True, exist_ok=True)
     local_link.write_text(json.dumps(link_result, ensure_ascii=False, indent=2), encoding="utf-8")
     s3.upload_file(str(local_link), cfg.s3_bucket, link_key)
+
+    # Optionelt: rydde wav for å spare disk (default: keep_wav_cache=False)
+    if wav_path is not None and wav_path.exists() and (not cfg.keep_wav_cache):
+        try:
+            wav_path.unlink()
+        except Exception:
+            pass
 
     print(f"OK: {relative} -> global speakers linket ({len(link_result['links'])} lokale speakere).")
 
