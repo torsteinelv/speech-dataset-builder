@@ -69,10 +69,22 @@ def read_jsonl_text(text: str) -> List[Dict[str, Any]]:
 
 
 def extract_first_json_object(s: str) -> str:
+    """Finner første { og siste } for å hente ut ren JSON fra rotete LLM-svar."""
+    # Rens markdown først
+    if "```" in s:
+        s = s.replace("```json", "").replace("```", "")
+    
     start = s.find("{")
     end = s.rfind("}")
+    
     if start == -1 or end == -1 or end <= start:
+        # Fallback: Hvis den returnerte en liste []
+        start_list = s.find("[")
+        end_list = s.rfind("]")
+        if start_list != -1 and end_list != -1:
+             return s[start_list : end_list + 1]
         raise ValueError("Fant ikke JSON-objekt i LLM-respons.")
+        
     return s[start : end + 1]
 
 
@@ -82,7 +94,6 @@ def clamp01(x: float) -> float:
 
 def is_plausible_person_name(name: str) -> bool:
     # Tillat norske bokstaver, bindestrek og apostrof.
-    # (Hold dette mildt – transkripsjon kan være lower-case.)
     n = name.strip()
     if not n:
         return False
@@ -384,59 +395,63 @@ def validate_assignment(
 # -----------------------------
 def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dict[str, Any]:
     system = (
-        "Du trekker ut navn på personer i en podcast basert KUN på eksplisitt tekstbevis.\n"
-        "Du får linjer formatert som:\n"
-        "  L0001|[start-end]|global_speaker_id|tekst\n\n"
-        "KRAV:\n"
-        "- Ikke gjett navn.\n"
-        "- Returner kun navn som står eksplisitt i en evidence-linje.\n"
-        "- Hver assignment MÅ ha evidence: line_id, quote (må være eksakt substring av linjens tekst), type.\n"
-        "- type må være 'self_intro' (personen sier selv 'jeg heter ...') eller 'host_intro' (en annen speaker introduserer personen).\n"
-        "Svar KUN med ett JSON-objekt."
+        "Du er en ekspert på å trekke ut PERSONNAVN fra transkripsjoner.\n"
+        "Din ENESTE oppgave er å finne ut hva folk heter basert på introduksjoner.\n\n"
+        
+        "REGLER FOR LOGIKK:\n"
+        "1. IKKE bruk navn som 'Host' eller 'Guest'. Vi trenger EKTE navn (f.eks 'Torstein', 'Eirik').\n"
+        "2. HVIS Speaker A sier: 'Velkommen Eirik', SÅ er Speaker A = Verten, og Speaker B (den som svarer eller snakker etterpå) = Eirik.\n"
+        "   - VIKTIG: Du må koble navnet 'Eirik' til Speaker B sin ID, IKKE Speaker A sin ID.\n"
+        "3. Ignorer generelle navn som 'dere', 'alle sammen', 'gjestene'.\n\n"
+
+        "EKSEMPEL 1 (Vert introduserer gjest):\n"
+        "Input:\n"
+        "L01|spk_host|Velkommen til deg, Eirik Kristensen.\n"
+        "L02|spk_host|Du har jobbet med jazz lenge.\n"
+        "L03|spk_guest|Ja, det stemmer.\n"
+        "Output JSON:\n"
+        "{\n"
+        '  "assignments": [\n'
+        '    { "global_speaker_id": "spk_guest", "name": "Eirik Kristensen", "confidence": 0.95, "evidence": { "type": "host_intro", "line_id": "L01", "quote": "Velkommen til deg, Eirik Kristensen" } }\n'
+        '  ]\n'
+        "}\n\n"
+        
+        "EKSEMPEL 2 (Selv-intro):\n"
+        "Input:\n"
+        "L05|spk_new|Hei, jeg heter Kari Nordmann.\n"
+        "Output JSON:\n"
+        "{\n"
+        '  "assignments": [\n'
+        '    { "global_speaker_id": "spk_new", "name": "Kari Nordmann", "confidence": 1.0, "evidence": { "type": "self_intro", "line_id": "L05", "quote": "jeg heter Kari Nordmann" } }\n'
+        '  ]\n'
+        "}\n\n"
+
+        "Svar KUN med gyldig JSON."
     )
 
     user = (
         f"EPISODE: {audio_file}\n\n"
-        "Her er utdraget:\n"
+        "TRANSKRIPSJON:\n"
         f"{snippet}\n\n"
-        "Oppgave:\n"
-        "Finn hvilke global_speaker_id som kan knyttes til et personnavn.\n\n"
-        "JSON-skjema:\n"
-        "{\n"
-        '  "episode": "...",\n'
-        '  "assignments": [\n'
-        "    {\n"
-        '      "global_speaker_id": "spk_...",\n'
-        '      "name": "Navn Som Står I Teksten",\n'
-        '      "confidence": 0.0,\n'
-        '      "evidence": {\n'
-        '        "type": "self_intro|host_intro",\n'
-        '        "line_id": "L0001",\n'
-        '        "quote": "eksakt substring fra linjen",\n'
-        '        "start": 0.0,\n'
-        '        "end": 0.0,\n'
-        '        "reason": "kort begrunnelse"\n'
-        "      }\n"
-        "    }\n"
-        "  ],\n"
-        '  "unknown": ["spk_...", "..."]\n'
-        "}\n"
+        "Finn navnene nå. Husk: Koble navnet til den personen som BLIR INTRODUSERT, ikke den som snakker."
     )
 
-    # --- ENDRING: Try/Except for å fange ugyldig JSON fra LLM ---
     try:
         content = llm_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}])
         
-        # Ekstra sikkerhet: hvis extract feiler eller json er ødelagt
-        json_str = extract_first_json_object(content)
-        obj = json.loads(json_str)
+        # Rens markdown
+        cleaned_content = content.strip()
+        if "```" in cleaned_content:
+            start = cleaned_content.find("{")
+            end = cleaned_content.rfind("}")
+            if start != -1 and end != -1:
+                cleaned_content = cleaned_content[start:end+1]
 
+        obj = json.loads(cleaned_content)
+        
     except Exception as e:
-        # Logg feilen, men la programmet leve videre
         print(f"⚠️  LLM JSON Error i {audio_file}: {e}")
-        # Returner et tomt objekt slik at vi kan fortsette til neste fil
         return {"assignments": [], "unknown": []}
-    # -----------------------------------------------------------
 
     if "assignments" not in obj:
         obj["assignments"] = []
