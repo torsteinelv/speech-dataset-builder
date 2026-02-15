@@ -174,7 +174,7 @@ def load_config() -> Config:
         processed_global_prefix=env_str("PROCESSED_GLOBAL_PREFIX", "processed_global"),
         global_prefix=env_str("GLOBAL_PREFIX", "global"),
         embedding_model=env_str("SPEAKER_EMBEDDING_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM"),
-        embedding_device=env_str("SPEAKER_EMBEDDING_DEVICE", "cpu"),
+        embedding_device=env_str("SPEAKER_EMBEDDING_DEVICE", "cuda"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"),
         sim_high=env_float("GLOBAL_SIM_HIGH", 0.78),
         sim_low=env_float("GLOBAL_SIM_LOW", 0.68),
