@@ -1,4 +1,3 @@
-# src/name_extractor.py
 from __future__ import annotations
 
 import argparse
@@ -424,8 +423,21 @@ def resolve_names_for_episode(cfg: Config, audio_file: str, snippet: str) -> Dic
         "}\n"
     )
 
-    content = llm_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}])
-    obj = json.loads(extract_first_json_object(content))
+    # --- ENDRING: Try/Except for å fange ugyldig JSON fra LLM ---
+    try:
+        content = llm_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+        
+        # Ekstra sikkerhet: hvis extract feiler eller json er ødelagt
+        json_str = extract_first_json_object(content)
+        obj = json.loads(json_str)
+
+    except Exception as e:
+        # Logg feilen, men la programmet leve videre
+        print(f"⚠️  LLM JSON Error i {audio_file}: {e}")
+        # Returner et tomt objekt slik at vi kan fortsette til neste fil
+        return {"assignments": [], "unknown": []}
+    # -----------------------------------------------------------
+
     if "assignments" not in obj:
         obj["assignments"] = []
     if "unknown" not in obj:
