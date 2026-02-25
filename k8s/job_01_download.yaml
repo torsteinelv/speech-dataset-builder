@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-01-download
+  namespace: dev
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: processor
+        image: ghcr.io/torsteinelv/speech-dataset-builder:latest
+        imagePullPolicy: Always
+        
+        command: ["/bin/sh", "-c"]
+        args: ["python src/download_podcast.py]
+
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_SECRET_ACCESS_KEY } }
+        - name: S3_ENDPOINT_URL
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_ENDPOINT_URL } }
+        - name: S3_BUCKET
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_BUCKET } }
+        - name: S3_BASE_PATH
+          value: "002_speech_dataset"
+          
+        resources:
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
