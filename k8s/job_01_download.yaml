@@ -17,7 +17,7 @@ spec:
         imagePullPolicy: Always
         
         command: ["/bin/sh", "-c"]
-        args: ["python src/download_podcast.py]
+        args: ["python src/download_podcast.py"]
 
         env:
         - name: AWS_ACCESS_KEY_ID
