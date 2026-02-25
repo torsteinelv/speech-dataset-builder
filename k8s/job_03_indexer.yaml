@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-03-indexer
+  namespace: dev
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-w1
+      restartPolicy: OnFailure
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: processor
+        image: ghcr.io/torsteinelv/speech-dataset-builder:latest
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args: ["python src/speaker_indexer.py"]
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_SECRET_ACCESS_KEY } }
+        - name: S3_ENDPOINT_URL
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_ENDPOINT_URL } }
+        - name: S3_BUCKET
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_BUCKET } }
+        - name: S3_BASE_PATH
+          value: "002_speech_dataset"
+        
+        # --- SØRLANDS-REGLENE (Strenge krav) ---
+        - name: GLOBAL_SIM_HIGH
+          value: "0.83"
+        - name: GLOBAL_MIN_TOTAL_SPEECH_SECONDS
+          value: "60.0"
+
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "8Gi"
+            cpu: "2"
+          requests:
+            nvidia.com/gpu: 1
