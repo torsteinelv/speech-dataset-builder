@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-04-clustering
+  namespace: dev
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 1
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-w1
+      restartPolicy: OnFailure
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: processor
+        image: ghcr.io/torsteinelv/speech-dataset-builder:latest
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args: ["python src/cluster_speakers.py"]
+        env:
+        # Samme S3-variabler som de andre jobbene (klipp og lim fra job_03)
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_SECRET_ACCESS_KEY } }
+        - name: S3_ENDPOINT_URL
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_ENDPOINT_URL } }
+        - name: S3_BUCKET
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_BUCKET } }
+        - name: S3_BASE_PATH
+          value: "002_speech_dataset"
+        resources:
+          limits:
+            memory: "16Gi" # Klynging av store mengder krever mye minne!
+            cpu: "4"
