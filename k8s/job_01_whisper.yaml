@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-01-whisper
+  namespace: dev
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-w1
+      restartPolicy: OnFailure
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: processor
+        image: ghcr.io/torsteinelv/speech-dataset-builder:latest
+        imagePullPolicy: Always
+        env:
+        # --- S3 CREDENTIALS ---
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_SECRET_ACCESS_KEY } }
+        - name: S3_ENDPOINT_URL
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_ENDPOINT_URL } }
+        - name: S3_BUCKET
+          valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_BUCKET } }
+        - name: HF_TOKEN
+          valueFrom: { secretKeyRef: { name: hf-secret, key: token } }
+
+        # --- PATHS ---
+        - name: S3_BASE_PATH
+          value: "002_speech_dataset"
+
+        # --- WHISPER CONFIG ---
+        - name: WHISPER_MODEL
+          value: "TheStigh/nb-whisper-large-ct2"
+        - name: SKIP_CT2_CONVERSION
+          value: "1"
+        - name: DEVICE
+          value: "cuda"
+        - name: COMPUTE_TYPE
+          value: "float16"
+        - name: BATCH_SIZE
+          value: "8"  # Økt fra 4 til 8 for raskere prosessering
+        - name: AUTO_BATCH_CAP
+          value: "1"
+        - name: ALLOW_MODEL_DOWNSIZE_ON_OOM
+          value: "1"
+        - name: ALLOW_CPU_FALLBACK_ON_OOM
+          value: "0"
+
+        # --- ALIGNMENT & DIARIZATION ---
+        - name: ENABLE_ALIGNMENT
+          value: "1"
+        - name: ALIGN_DEVICE
+          value: "cuda"
+        - name: ENABLE_DIARIZATION
+          value: "1"
+        - name: STRICT_DIARIZATION
+          value: "0"
+        - name: DIARIZATION_DEVICE
+          value: "cuda"
+
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "16Gi" # Hindrer at den kræsjer noden
+            cpu: "4"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "8Gi"
+            cpu: "2"
