@@ -20,7 +20,6 @@ spec:
         command: ["/bin/sh", "-c"]
         args: ["python src/cluster_speakers.py"]
         env:
-        # Samme S3-variabler som de andre jobbene (klipp og lim fra job_03)
         - name: AWS_ACCESS_KEY_ID
           valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: AWS_ACCESS_KEY_ID } }
         - name: AWS_SECRET_ACCESS_KEY
@@ -31,7 +30,13 @@ spec:
           valueFrom: { secretKeyRef: { name: speech-dataset-secrets, key: S3_BUCKET } }
         - name: S3_BASE_PATH
           value: "002_speech_dataset"
+          
         resources:
           limits:
-            memory: "16Gi" # Klynging av store mengder krever mye minne!
+            nvidia.com/gpu: 1
+            memory: "16Gi" # Fortsatt lurt med mye systemminne for matrisen
             cpu: "4"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "8Gi"
+            cpu: "2"
