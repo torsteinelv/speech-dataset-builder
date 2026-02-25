@@ -7,6 +7,7 @@ import argparse
 import html
 from pathlib import Path
 from dotenv import load_dotenv
+import subprocess
 
 load_dotenv()
 
@@ -24,6 +25,29 @@ S3_TARGET_ROOT = f"{S3_BASE_PATH}/raw/"
 SUBSCRIPTION_FILE_KEY = f"{S3_TARGET_ROOT}subscriptions.txt"
 
 TEMP_DIR = Path("temp_downloads")
+
+
+def get_nrk_episodes(url):
+    """Bruker yt-dlp for å hente alle episoder fra en NRK-side"""
+    print(f" -> Bruker yt-dlp for å hente arkiv fra NRK...")
+    cmd = [
+        'yt-dlp', 
+        '--get-title', 
+        '--get-url', 
+        '--extract-audio',
+        '--flat-playlist', # Gjør det raskere å hente listen
+        url
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    lines = result.stdout.strip().split('\n')
+    
+    # Mapper titler og URL-er (yt-dlp returnerer dem annenhver linje med disse flaggene)
+    episodes = []
+    for i in range(0, len(lines), 2):
+        if i+1 < len(lines):
+            episodes.append({'title': lines[i], 'url': lines[i+1]})
+    return episodes
+
 
 def get_s3_client():
     return boto3.client(
@@ -73,38 +97,45 @@ def save_subscription(s3, new_url):
         print(f"FEIL: Klarte ikke oppdatere abonnement-listen i S3: {e}")
 
 # --- HOVEDLOGIKK ---
-def process_single_feed(rss_url, s3):
+def process_single_feed(url, s3):
     TEMP_DIR.mkdir(exist_ok=True)
+    
+    # Sjekk om det er en NRK-nettside eller vanlig RSS
+    is_nrk_web = "radio.nrk.no" in url
+    
+    if is_nrk_web:
+        podcast_title = clean_filename(url.split('/')[-1].capitalize())
+        episodes = get_nrk_episodes(url)
+    else:
+        print(f"\nSjekker RSS: {url} ...")
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            print(f"Klarte ikke lese RSS: {e}")
+            return
 
-    print(f"\nSjekker RSS: {rss_url} ...")
-    try:
-        feed = feedparser.parse(rss_url)
-    except Exception as e:
-        print(f"Klarte ikke lese RSS: {e}")
-        return
+        if not feed.entries:
+            print(" -> Ingen episoder funnet.")
+            return
 
-    if not feed.entries:
-        print(" -> Ingen episoder funnet.")
-        return
+        podcast_title = clean_filename(feed.feed.get('title', 'Ukjent_Podcast'))
+        episodes = []
+        for entry in feed.entries:
+            mp3_url = next((l.href for l in entry.links if l.rel == 'enclosure' and 'audio' in l.type), None)
+            if mp3_url:
+                episodes.append({'title': entry.title, 'url': mp3_url})
 
-    podcast_title = clean_filename(feed.feed.get('title', 'Ukjent_Podcast'))
-    print(f" -> Podcast: {podcast_title} ({len(feed.entries)} episoder)")
+    print(f" -> Podcast: {podcast_title} ({len(episodes)} episoder)")
 
-    for entry in feed.entries:
-        episode_title = clean_filename(entry.title)
+    for ep in episodes:
+        episode_title = clean_filename(ep['title'])
+        mp3_url = ep['url']
         
-        mp3_url = None
-        for link in entry.links:
-            if link.rel == 'enclosure' and 'audio' in link.type:
-                mp3_url = link.href
-                break
-        
-        if not mp3_url: continue
-
         filename = f"{episode_title}.mp3"
         s3_key = f"{S3_TARGET_ROOT}{podcast_title}/{filename}"
         local_path = TEMP_DIR / filename
 
+        # Sjekk om filen allerede finnes i S3
         try:
             s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
             # print(f"SKIP (Finnes): {filename}") 
@@ -113,19 +144,25 @@ def process_single_feed(rss_url, s3):
             pass 
 
         print(f" -> LASTER NED: {episode_title} ...")
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
         try:
-            with requests.get(mp3_url, stream=True) as r:
-                r.raise_for_status()
-                with open(local_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
+            if is_nrk_web:
+                # yt-dlp for nedlasting av selve lydfilen fra NRK
+                subprocess.run(['yt-dlp', '-x', '--audio-format', 'mp3', '-o', str(local_path), mp3_url], check=True, capture_output=True)
+            else:
+                # Vanlig nedlasting for RSS
+                with requests.get(mp3_url, stream=True, headers=headers) as r:
+                    r.raise_for_status()
+                    with open(local_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
             
             print(f"    -> Laster opp til S3...")
             s3.upload_file(str(local_path), S3_BUCKET, s3_key)
 
         except Exception as e:
             print(f"    -> FEILET: {e}")
-        
         finally:
             if local_path.exists(): local_path.unlink()
 
