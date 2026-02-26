@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: job-01-whisper
+  name: job-02-whisper
   namespace: dev
 spec:
   ttlSecondsAfterFinished: 86400
