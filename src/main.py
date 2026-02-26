@@ -14,6 +14,7 @@ import boto3
 import pandas as pd
 import torch
 import whisperx
+import random
 from dotenv import load_dotenv
 
 # -----------------------------
@@ -581,6 +582,8 @@ def process_audio() -> None:
     print(f"Lister filer i s3://{cfg.s3_bucket}/{cfg.s3_input_prefix}...")
     files = list_mp3_keys(cfg, s3)
     print(f"Fant {len(files)} mp3-filer.")
+
+    random.shuffle(files)
 
     for idx, s3_key in enumerate(files, start=1):
         relative, out_key = s3_result_key(cfg, s3_key)
