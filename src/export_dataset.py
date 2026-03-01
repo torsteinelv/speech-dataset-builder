@@ -4,6 +4,10 @@ import subprocess
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
+import io
+import wave
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -20,32 +24,57 @@ BUCKET = os.getenv("S3_BUCKET", "ml-data")
 MIN_DURATION = 2.0  
 MAX_DURATION = 15.0 
 
-# Henter BASE_PATH direkte fra .env (f.eks. 002_speech_dataset)
 BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
-
-# Nå havner eksporten riktig sted: inni prosjektmappen!
 OUT_BASE = f"{BASE_PATH}/parquet"
+DONE_BASE = f"{BASE_PATH}/parquet_done"
+
+SR = 24000
+SAMPWIDTH = 2  # int16
+NCH = 1
+
+# Definer et strengt og innholdsrikt skjema for Hugging Face
+SCHEMA = pa.schema([
+    pa.field("id", pa.string()),
+    pa.field("audio", pa.struct([
+        pa.field("bytes", pa.binary()),
+        pa.field("path", pa.string()),
+    ])),
+    pa.field("speaker", pa.string()),
+    pa.field("text", pa.string()),
+    pa.field("start", pa.float32()),
+    pa.field("end", pa.float32()),
+    pa.field("dur", pa.float32()),
+    pa.field("source", pa.string()),
+    pa.field("episode_key", pa.string()),
+])
+
+def wav_bytes_from_int16(mono_int16: np.ndarray) -> bytes:
+    """Bygger en gyldig .wav-fil i minnet fra et numpy-array."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(NCH)
+        wf.setsampwidth(SAMPWIDTH)
+        wf.setframerate(SR)
+        wf.writeframes(mono_int16.tobytes())
+    return buf.getvalue()
 
 def get_processed_files(s3):
-    """Henter en liste over alle episoder som er ferdig prosessert av Jobb 3/4."""
     print(f"🔍 Leter etter prosesserte episoder i {BASE_PATH}/processed_global/...")
     paginator = s3.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{BASE_PATH}/processed_global/")
     return sorted([obj['Key'] for page in pages if 'Contents' in page for obj in page['Contents'] if obj['Key'].endswith(".jsonl")])
 
-def get_exported_parquets(s3):
-    """Sjekker hvilke Parquet-filer vi allerede har bygget (Smart Resume)."""
-    print(f"🔍 Sjekker hvilke episoder som allerede er eksportert til {OUT_BASE}/...")
+def get_exported_markers(s3):
+    print(f"🔍 Sjekker hvilke episoder som allerede er ferdige i {DONE_BASE}/...")
     try:
         paginator = s3.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{OUT_BASE}/")
-        # Vi forventer at filnavnene er: {podcast_navn}___{episode_navn}.parquet
-        return {obj['Key'].split('/')[-1] for page in pages if 'Contents' in page for obj in page['Contents'] if obj['Key'].endswith(".parquet")}
+        pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{DONE_BASE}/")
+        return {obj['Key'].split('/')[-1].replace('.done', '') for page in pages if 'Contents' in page for obj in page['Contents'] if obj['Key'].endswith(".done")}
     except Exception:
         return set()
 
 def main():
-    print("🚀 Starter PARQUET EXPORT for Multi-Speaker Datasett (Kun Speaker IDs)!")
+    print("🚀 Starter LYNKJAPP PARQUET EXPORT for Multi-Speaker Datasett!")
     
     try:
         s3 = boto3.client('s3', endpoint_url=S3_ENDPOINT, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY)
@@ -54,9 +83,9 @@ def main():
         return
         
     all_episodes = get_processed_files(s3)
-    exported_files = get_exported_parquets(s3)
+    exported_markers = get_exported_markers(s3)
     
-    print(f"📦 Fant {len(all_episodes)} episoder. {len(exported_files)} er allerede eksportert.")
+    print(f"📦 Fant {len(all_episodes)} episoder. {len(exported_markers)} er allerede eksportert.")
 
     Path("temp_audio").mkdir(exist_ok=True)
     
@@ -64,14 +93,20 @@ def main():
     total_seconds = 0.0
     
     for ep_index, ep_key in enumerate(all_episodes, 1):
+        # Kilde-agnostisk nøkkelhåndtering
+        # Går fra 002_speech_dataset/processed_global/podcast/ep.jsonl -> 002_speech_dataset/raw/podcast/ep.mp3
+        s3_audio_key = ep_key.replace("processed_global/", "raw/").replace(".jsonl", ".mp3")
+        
         parts = ep_key.split('/')
-        podcast_name = parts[2] if len(parts) >= 4 else "Ukjent"
+        source_name = parts[-2] if len(parts) >= 2 else "Ukjent"
         ep_name_base = parts[-1].replace('.jsonl', '')
         
-        # Sjekk Smart Resume
-        parquet_filename = f"{podcast_name}___{ep_name_base}.parquet"
+        # Unik tag for å unngå kollisjoner i Kubernetes
+        ep_hash = hashlib.sha1(ep_key.encode()).hexdigest()[:10]
+        safe_base_name = f"{source_name}___{ep_name_base}"
         
-        if parquet_filename in exported_files:
+        # Smart Resume via .done-markører
+        if safe_base_name in exported_markers:
             continue
             
         print(f"⏳ Prosesserer [{ep_index}/{len(all_episodes)}]: {ep_name_base}...")
@@ -95,7 +130,6 @@ def main():
                 end = data.get("end", 0.0)
                 dur = end - start
                 
-                # Bruk KUN raw spk_id, sjekker at klippet er av god lengde
                 if spk_id and MIN_DURATION <= dur <= MAX_DURATION and len(text) > 2:
                     segments.append({
                         "speaker": spk_id,
@@ -108,88 +142,115 @@ def main():
                 continue
                 
         if not segments:
-            # Lag en tom parquet-fil så vi vet at vi har sjekket denne episoden
-            try:
-                empty_table = pa.Table.from_arrays([pa.array([], type=pa.binary()), pa.array([], type=pa.string()), pa.array([], type=pa.string())], names=['audio', 'speaker', 'text'])
-                local_empty = f"temp_audio/{parquet_filename}"
-                pq.write_table(empty_table, local_empty)
-                s3.upload_file(local_empty, BUCKET, f"{OUT_BASE}/{parquet_filename}")
-                os.remove(local_empty)
-            except Exception as e:
-                print(f"⚠️ Kunne ikke lage tom fil for {parquet_filename}: {e}")
+            # Ingen gyldige klipp -> Skriv .done markør og gå videre
+            s3.put_object(Bucket=BUCKET, Key=f"{DONE_BASE}/{safe_base_name}.done", Body=b"done")
             continue
 
-        # 2. Last ned original-lyden fra prosjektets 'raw' mappe
-        s3_audio_key = f"{BASE_PATH}/raw/{podcast_name}/{ep_name_base}.mp3"
-        local_mp3 = "temp_audio/temp_ep.mp3"
+        # 2. Last ned original-lyden
+        local_mp3 = f"temp_audio/{ep_hash}.mp3"
         try:
             s3.download_file(BUCKET, s3_audio_key, local_mp3)
         except Exception as e:
             print(f"❌ Fant ikke lyd for {ep_name_base} ({s3_audio_key}). Hopper over.")
             continue
 
-        # 3. Klipp lyden til minnet
-        audio_data = []
-        speaker_data = []
-        text_data = []
+        # 3. Konverter hele episoden til PCM i én FFmpeg-operasjon
+        local_pcm = f"temp_audio/{ep_hash}.s16"
+        cmd = [
+            "ffmpeg", "-y", "-i", local_mp3,
+            "-ar", str(SR), "-ac", str(NCH),
+            "-f", "s16le", local_pcm
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except subprocess.CalledProcessError:
+            print(f"❌ FFmpeg feilet på {ep_name_base}. Hopper over.")
+            os.remove(local_mp3)
+            continue
+
+        # 4. Slice direkte i minnet
+        try:
+            pcm = np.memmap(local_pcm, dtype=np.int16, mode="r")
+        except Exception as e:
+            print(f"❌ Klarte ikke lese PCM for {ep_name_base}: {e}")
+            os.remove(local_mp3)
+            if os.path.exists(local_pcm): os.remove(local_pcm)
+            continue
+
+        id_data, audio_data, speaker_data, text_data = [], [], [], []
+        start_data, end_data, dur_data, source_data, ep_data = [], [], [], [], []
         
         for i, seg in enumerate(segments):
-            local_wav = f"temp_audio/clip_{i}.wav"
+            s = max(0, int(seg["start"] * SR))
+            e = max(s + 1, int(seg["end"] * SR))
             
-            cmd = [
-                "ffmpeg", "-y", "-i", local_mp3,
-                "-ss", str(seg["start"]), "-to", str(seg["end"]),
-                "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
-                local_wav
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Unngå out-of-bounds hvis Whisper traff litt forbi slutten av filen
+            if s >= len(pcm): continue
+            e = min(e, len(pcm))
             
-            if os.path.exists(local_wav):
-                with open(local_wav, "rb") as f:
-                    wav_bytes = f.read()
-                    
-                audio_data.append({"bytes": wav_bytes, "path": f"clip_{i}.wav"})
-                speaker_data.append(seg["speaker"])
-                text_data.append(seg["text"])
-                
-                total_seconds += seg["dur"]
-                total_new_clips += 1
-                os.remove(local_wav)
+            clip = np.asarray(pcm[s:e])
+            wb = wav_bytes_from_int16(clip)
             
-        if os.path.exists(local_mp3):
-            os.remove(local_mp3)
+            clip_path = f"{safe_base_name}___{i:06d}.wav"
+            clip_id = hashlib.sha1(f"{ep_key}:{seg['start']:.3f}:{seg['speaker']}".encode()).hexdigest()[:16]
+            
+            id_data.append(clip_id)
+            audio_data.append({"bytes": wb, "path": clip_path})
+            speaker_data.append(seg["speaker"])
+            text_data.append(seg["text"])
+            start_data.append(seg["start"])
+            end_data.append(seg["end"])
+            dur_data.append(seg["dur"])
+            source_data.append(source_name)
+            ep_data.append(ep_name_base)
+            
+            total_seconds += seg["dur"]
+            total_new_clips += 1
 
-        # 4. Bygg og last opp Parquet
+        # Rydd opp store filer lokalt med en gang
+        del pcm
+        os.remove(local_mp3)
+        os.remove(local_pcm)
+
+        # 5. Bygg og last opp Parquet
         if audio_data:
             try:
-                schema = pa.schema([
-                    pa.field('audio', pa.struct([
-                        pa.field('bytes', pa.binary()),
-                        pa.field('path', pa.string())
-                    ])),
-                    pa.field('speaker', pa.string()),
-                    pa.field('text', pa.string())
-                ])
-                
                 table = pa.Table.from_arrays(
-                    [pa.array(audio_data), pa.array(speaker_data), pa.array(text_data)],
-                    schema=schema
+                    [
+                        pa.array(id_data, type=pa.string()),
+                        pa.array(audio_data, type=SCHEMA.field('audio').type),
+                        pa.array(speaker_data, type=pa.string()),
+                        pa.array(text_data, type=pa.string()),
+                        pa.array(start_data, type=pa.float32()),
+                        pa.array(end_data, type=pa.float32()),
+                        pa.array(dur_data, type=pa.float32()),
+                        pa.array(source_data, type=pa.string()),
+                        pa.array(ep_data, type=pa.string()),
+                    ],
+                    schema=SCHEMA
                 )
                 
-                local_parquet = f"temp_audio/{parquet_filename}"
-                pq.write_table(table, local_parquet)
+                local_parquet = f"temp_audio/{ep_hash}.parquet"
+                # Komprimerer lyd med zstd for optimal filstørrelse/fart
+                pq.write_table(table, local_parquet, compression="zstd", compression_level=3)
                 
-                s3.upload_file(local_parquet, BUCKET, f"{OUT_BASE}/{parquet_filename}")
+                parquet_s3_key = f"{OUT_BASE}/{safe_base_name}.parquet"
+                s3.upload_file(local_parquet, BUCKET, parquet_s3_key)
+                
+                # Skriv markør for Smart Resume
+                s3.put_object(Bucket=BUCKET, Key=f"{DONE_BASE}/{safe_base_name}.done", Body=b"done")
+                
                 os.remove(local_parquet)
-                print(f"✅ Lagret {parquet_filename} med {len(audio_data)} klipp.")
+                print(f"✅ Lagret {safe_base_name}.parquet med {len(audio_data)} klipp.")
             except Exception as e:
-                print(f"❌ Feil ved lagring av parquet {parquet_filename}: {e}")
+                print(f"❌ Feil ved lagring av parquet for {ep_name_base}: {e}")
 
     print("\n" + "="*60)
     print("🎉 PARQUET EXPORT FERDIG!")
     print(f"📂 Nye lydklipp eksportert : {total_new_clips}")
     print(f"⏱️ Ny eksportert taletid   : {total_seconds / 3600:.2f} timer")
-    print(f"📍 Alt ligger klart i S3   : s3://{BUCKET}/{OUT_BASE}/")
+    print(f"📍 Datasett   : s3://{BUCKET}/{OUT_BASE}/")
+    print(f"📍 Markører   : s3://{BUCKET}/{DONE_BASE}/")
     print("="*60)
 
 if __name__ == "__main__":
