@@ -19,7 +19,9 @@ BUCKET = os.getenv("S3_BUCKET", "ml-data")
 # ==========================================
 MIN_DURATION = 2.0  
 MAX_DURATION = 15.0 
-BASE_PATH = "002_speech_dataset"
+
+# Henter BASE_PATH direkte fra .env (002_speech_dataset)
+BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
 OUT_BASE = "003_final_dataset/parquet"
 
 def get_processed_files(s3):
@@ -91,7 +93,7 @@ def main():
                 end = data.get("end", 0.0)
                 dur = end - start
                 
-                # Bruk KUN raw spk_id
+                # Bruk KUN raw spk_id, sjekker at klippet er av god lengde
                 if spk_id and MIN_DURATION <= dur <= MAX_DURATION and len(text) > 2:
                     segments.append({
                         "speaker": spk_id,
@@ -115,13 +117,13 @@ def main():
                 print(f"⚠️ Kunne ikke lage tom fil for {parquet_filename}: {e}")
             continue
 
-        # 2. Last ned original-lyden
-        s3_audio_key = f"{BASE_PATH}/audio/{podcast_name}/{ep_name_base}.mp3"
+        # 2. Last ned original-lyden (NÅ MED RIKTIG 'raw' MAPPE!)
+        s3_audio_key = f"{BASE_PATH}/raw/{podcast_name}/{ep_name_base}.mp3"
         local_mp3 = "temp_audio/temp_ep.mp3"
         try:
             s3.download_file(BUCKET, s3_audio_key, local_mp3)
-        except Exception:
-            print(f"❌ Fant ikke lyd for {ep_name_base}. Hopper over.")
+        except Exception as e:
+            print(f"❌ Fant ikke lyd for {ep_name_base} ({s3_audio_key}). Hopper over.")
             continue
 
         # 3. Klipp lyden til minnet
