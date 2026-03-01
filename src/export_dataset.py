@@ -20,20 +20,22 @@ BUCKET = os.getenv("S3_BUCKET", "ml-data")
 MIN_DURATION = 2.0  
 MAX_DURATION = 15.0 
 
-# Henter BASE_PATH direkte fra .env (002_speech_dataset)
+# Henter BASE_PATH direkte fra .env (f.eks. 002_speech_dataset)
 BASE_PATH = os.getenv("S3_BASE_PATH", "002_speech_dataset")
-OUT_BASE = "003_final_dataset/parquet"
+
+# Nå havner eksporten riktig sted: inni prosjektmappen!
+OUT_BASE = f"{BASE_PATH}/parquet"
 
 def get_processed_files(s3):
     """Henter en liste over alle episoder som er ferdig prosessert av Jobb 3/4."""
-    print("🔍 Leter etter prosesserte episoder i S3...")
+    print(f"🔍 Leter etter prosesserte episoder i {BASE_PATH}/processed_global/...")
     paginator = s3.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{BASE_PATH}/processed_global/")
     return sorted([obj['Key'] for page in pages if 'Contents' in page for obj in page['Contents'] if obj['Key'].endswith(".jsonl")])
 
 def get_exported_parquets(s3):
     """Sjekker hvilke Parquet-filer vi allerede har bygget (Smart Resume)."""
-    print("🔍 Sjekker hvilke episoder som allerede er eksportert...")
+    print(f"🔍 Sjekker hvilke episoder som allerede er eksportert til {OUT_BASE}/...")
     try:
         paginator = s3.get_paginator('list_objects_v2')
         pages = paginator.paginate(Bucket=BUCKET, Prefix=f"{OUT_BASE}/")
@@ -117,7 +119,7 @@ def main():
                 print(f"⚠️ Kunne ikke lage tom fil for {parquet_filename}: {e}")
             continue
 
-        # 2. Last ned original-lyden (NÅ MED RIKTIG 'raw' MAPPE!)
+        # 2. Last ned original-lyden fra prosjektets 'raw' mappe
         s3_audio_key = f"{BASE_PATH}/raw/{podcast_name}/{ep_name_base}.mp3"
         local_mp3 = "temp_audio/temp_ep.mp3"
         try:
@@ -146,7 +148,6 @@ def main():
                 with open(local_wav, "rb") as f:
                     wav_bytes = f.read()
                     
-                # Hugging Face Audio Feature format: en dict med "bytes" og valgfri "path"
                 audio_data.append({"bytes": wav_bytes, "path": f"clip_{i}.wav"})
                 speaker_data.append(seg["speaker"])
                 text_data.append(seg["text"])
@@ -161,7 +162,6 @@ def main():
         # 4. Bygg og last opp Parquet
         if audio_data:
             try:
-                # Definer skjemaet eksplisitt for å unngå Arrow-feil
                 schema = pa.schema([
                     pa.field('audio', pa.struct([
                         pa.field('bytes', pa.binary()),
