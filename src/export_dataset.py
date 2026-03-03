@@ -32,13 +32,14 @@ SR = 24000
 SAMPWIDTH = 2  # int16
 NCH = 1
 
+# 🟢 FIKSET: Kolonnen heter nå "speaker_id" i stedet for "speaker"
 SCHEMA = pa.schema([
     pa.field("id", pa.string()),
     pa.field("audio", pa.struct([
         pa.field("bytes", pa.binary()),
         pa.field("path", pa.string()),
     ])),
-    pa.field("speaker", pa.string()),
+    pa.field("speaker_id", pa.string()),
     pa.field("text", pa.string()),
     pa.field("start", pa.float32()),
     pa.field("end", pa.float32()),
@@ -73,7 +74,7 @@ def get_exported_markers(s3):
         return set()
 
 def main():
-    print("🚀 Starter LYNKJAPP PARQUET EXPORT for Multi-Speaker Datasett!")
+    print("🚀 Starter LYNKJAPP PARQUET EXPORT for Multi-Speaker Datasett (med speaker_id)!")
     
     try:
         s3 = boto3.client('s3', endpoint_url=S3_ENDPOINT, aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY)
@@ -94,10 +95,8 @@ def main():
     for ep_index, ep_key in enumerate(all_episodes, 1):
         rel_path = ep_key.split(f"{BASE_PATH}/processed_global/", 1)[-1]
         
-        # Fjerner .jsonl
         rel_no_jsonl = rel_path[:-6] if rel_path.endswith(".jsonl") else rel_path
         
-        # 🟢 FIKSEN ER HER: Sørger for at S3-nøkkelen ALLTID har .mp3 på slutten!
         if not rel_no_jsonl.endswith(".mp3"):
             s3_audio_key = f"{BASE_PATH}/raw/{rel_no_jsonl}.mp3"
         else:
@@ -133,7 +132,7 @@ def main():
                 
                 if spk_id and MIN_DURATION <= dur <= MAX_DURATION and len(text) > 2:
                     segments.append({
-                        "speaker": spk_id,
+                        "speaker_id": spk_id, # Bruker konsekvent speaker_id lokalt også
                         "text": text,
                         "start": start,
                         "end": end,
@@ -192,12 +191,12 @@ def main():
             clip_path = f"{safe_base_name}___{i:06d}.wav"
             
             clip_id = hashlib.sha1(
-                f"{ep_key}:{seg['start']:.3f}:{seg['end']:.3f}:{seg['speaker']}:{len(seg['text'])}".encode()
+                f"{ep_key}:{seg['start']:.3f}:{seg['end']:.3f}:{seg['speaker_id']}:{len(seg['text'])}".encode()
             ).hexdigest()[:16]
             
             id_data.append(clip_id)
             audio_data.append({"bytes": wb, "path": clip_path})
-            speaker_data.append(seg["speaker"])
+            speaker_data.append(seg["speaker_id"])
             text_data.append(seg["text"])
             start_data.append(seg["start"])
             end_data.append(seg["end"])
@@ -219,7 +218,7 @@ def main():
                     [
                         pa.array(id_data, type=pa.string()),
                         pa.array(audio_data, type=SCHEMA.field('audio').type),
-                        pa.array(speaker_data, type=pa.string()),
+                        pa.array(speaker_data, type=pa.string()), # Her putter vi inn speaker_id-dataene
                         pa.array(text_data, type=pa.string()),
                         pa.array(start_data, type=pa.float32()),
                         pa.array(end_data, type=pa.float32()),
@@ -238,7 +237,7 @@ def main():
                     local_parquet, 
                     compression="zstd", 
                     compression_level=3,
-                    use_dictionary=["speaker", "source"]
+                    use_dictionary=["speaker_id", "source"] # Oppdatert dictionary referanse
                 )
                 
                 parquet_s3_key = f"{OUT_BASE}/{safe_base_name}.parquet"
