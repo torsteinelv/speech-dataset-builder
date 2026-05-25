@@ -3,7 +3,7 @@ python-dotenv==1.2.1
 requests==2.32.5
 feedparser==6.0.12
 
-whisperx==3.4.3
+whisperx==3.8.6
 faster-whisper==1.2.1
 ctranslate2==4.4.0
 
