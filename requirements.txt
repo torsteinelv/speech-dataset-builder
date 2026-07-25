@@ -9,7 +9,7 @@ ctranslate2==4.4.0
 
 pyannote-audio==3.4.0
 
-pandas==3.0.0
+pandas==3.0.5
 soundfile==0.13.1
 
 torch==2.5.1
