@@ -1,4 +1,4 @@
-boto3==1.42.44
+boto3==1.43.89
 python-dotenv==1.2.1
 requests==2.32.5
 feedparser==6.0.12
