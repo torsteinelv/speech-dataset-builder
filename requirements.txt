@@ -12,7 +12,7 @@ pyannote-audio==3.4.0
 pandas==3.0.0
 soundfile==0.13.1
 
-torch==2.5.1
+torch==2.14.0
 torchaudio==2.5.1
 
 scikit-learn==1.6.1
