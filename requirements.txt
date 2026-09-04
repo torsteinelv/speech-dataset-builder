@@ -5,7 +5,7 @@ feedparser==6.0.12
 
 whisperx==3.4.3
 faster-whisper==1.2.1
-ctranslate2==4.4.0
+ctranslate2==4.8.2
 
 pyannote-audio==3.4.0
 
